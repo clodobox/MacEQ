@@ -671,13 +671,21 @@ final class EQController: ObservableObject {
             Double(status.bufferFrameSize) / status.sampleRate * 1000,
             cpuPercent
         )
-        diagnosticLines = [
+        var lines = [
             "Tap format: \(status.tapFormatDescription)",
             String(format: "IO buffer: %u frames (~%.1f ms)", status.bufferFrameSize, Double(status.bufferFrameSize) / status.sampleRate * 1000),
             String(format: "Peak: %.1f dBFS", peakDB),
             "Callbacks: \(stats.callbackCount), silent streak: \(stats.consecutiveZeroBuffers)",
             "Watchdog restarts: \(watchdogRestartCount)",
-        ] + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
+        ]
+        if status.tapCompensationGain != 1 {
+            lines.append(String(
+                format: "Multi-output compensation: x%.0f (+%.1f dB)",
+                status.tapCompensationGain,
+                20 * log10(Double(status.tapCompensationGain))
+            ))
+        }
+        diagnosticLines = lines + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
         writeStatusSnapshot()
         checkZeroBufferWatchdog(status: status, stats: stats)
     }
@@ -694,7 +702,8 @@ final class EQController: ObservableObject {
     }
 
     /// Debug aid: mirrors live state to a file so the audio path can be inspected
-    /// without reading the screen. Best-effort by design; remove after Milestone 1.
+    /// without reading the screen. Best-effort by design; kept through the soak
+    /// period to observe the zero-buffer watchdog, removed before distribution.
     private func writeStatusSnapshot() {
         let snapshot = """
         timestamp: \(Date())
@@ -704,24 +713,10 @@ final class EQController: ObservableObject {
         preamp: \(effectivePreampDB) (auto: \(autoPreampEnabled))
         error: \(errorMessage ?? "none")
         status: \(statusSummary)
+        watchdog: \(watchdogRestartCount) restarts\(lastWatchdogRestart.map { ", last \($0)" } ?? "")
         \(diagnosticLines.joined(separator: "\n"))
         """
-        let processTable = audioProcessTable().joined(separator: "\n")
-        try? (snapshot + "\nexcluded: \(excludedBundleIDs.sorted())\naudio processes:\n" + processTable)
+        try? (snapshot + "\nexcluded: \(excludedBundleIDs.sorted())")
             .write(toFile: "/tmp/maceq-spike-status.txt", atomically: true, encoding: .utf8)
-    }
-
-    /// Debug: how each live audio process attributes to an app, for diagnosing
-    /// exclude-list matching.
-    private func audioProcessTable() -> [String] {
-        guard let objects = try? audioProcessObjectIDs() else { return ["<process list unavailable>"] }
-        return objects.compactMap { object in
-            guard let processPID = try? pid(ofAudioProcess: object) else { return nil }
-            let coreBundle = (try? bundleID(ofAudioProcess: object)) ?? "-"
-            let directBundle = NSRunningApplication(processIdentifier: processPID)?.bundleIdentifier ?? "-"
-            let responsiblePID = responsibility_get_pid_responsible_for_pid(processPID)
-            let responsibleBundle = NSRunningApplication(processIdentifier: responsiblePID)?.bundleIdentifier ?? "-"
-            return "  pid=\(processPID) core=\(coreBundle) direct=\(directBundle) responsible(\(responsiblePID))=\(responsibleBundle)"
-        }
     }
 }

@@ -146,6 +146,14 @@ func activeSubDeviceIDs(of aggregateID: AudioObjectID) throws -> [AudioObjectID]
     return ids
 }
 
+/// Sub-device count of a multi-output/aggregate device; 1 for plain devices
+/// (which have no sub-device list — that read failing is the normal case).
+/// The process tap attenuates the captured mix by this factor.
+func outputSubDeviceCount(of deviceID: AudioObjectID) -> Int {
+    guard let subDevices = try? activeSubDeviceIDs(of: deviceID) else { return 1 }
+    return max(subDevices.count, 1)
+}
+
 /// Number of output streams a device exposes. For our aggregate this must include
 /// the real output device's stream, or there is nothing audible to write to.
 func outputStreamCount(of deviceID: AudioObjectID) throws -> Int {

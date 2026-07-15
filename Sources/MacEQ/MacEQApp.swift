@@ -5,9 +5,17 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let controller = EQController()
+    private var hotkeyManager: HotkeyManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.controller.start()
+        // Carbon delivers the hotkey on the main thread; hop into the actor
+        // explicitly since the C callback carries no isolation.
+        hotkeyManager = HotkeyManager {
+            DispatchQueue.main.async {
+                AppDelegate.controller.eqEnabled.toggle()
+            }
+        }
     }
 }
 
@@ -74,7 +82,7 @@ struct EQPopoverView: View {
             Toggle("", isOn: $controller.eqEnabled)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .help("Enable or bypass the equalizer")
+                .help("Enable or bypass the equalizer (⌥⌘E anywhere)")
             Menu {
                 Button("Reset All Bands") { controller.resetAllBands() }
                 Toggle("Safety Limiter", isOn: $controller.limiterEnabled)

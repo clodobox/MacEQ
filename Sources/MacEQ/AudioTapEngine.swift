@@ -1,3 +1,4 @@
+import Accelerate
 import CoreAudio
 import Foundation
 import MacEQCore
@@ -79,39 +80,6 @@ final class IOStats {
     var lastRMS: Float { Float(bitPattern: lastRMSBits) }
 }
 
-/// Debug instrumentation for Milestone 0: captures the buffer layout seen by the
-/// first IO callback, and a test-tone switch that writes a sine directly to the
-/// output buffers (bypassing tap input) to isolate output-path failures from
-/// tap-input failures. Same word-sized-store rationale as IOStats.
-final class DebugProbe {
-    var layoutCaptured: Bool = false
-    var inputBufferCount: UInt32 = 0
-    var outputBufferCount: UInt32 = 0
-    var inputChannels: UInt32 = 0
-    var inputByteSize: UInt32 = 0
-    var outputChannels: UInt32 = 0
-    var outputByteSize: UInt32 = 0
-    /// First 8 raw Float samples of the first input buffer, refreshed every callback.
-    let firstSamples = UnsafeMutablePointer<Float>.allocate(capacity: 8)
-    /// Largest absolute sample value seen since start.
-    var maxSampleEverBits: UInt32 = 0
-
-    /// UI writes, audio thread reads: replace passthrough with a 440 Hz sine at -20 dBFS.
-    var toneEnabled: Bool = false
-    /// Callbacks handled in tone mode, proving the IOProc stays alive there.
-    var toneCallbackCount: UInt64 = 0
-    /// Sine phase, touched only by the audio thread.
-    var tonePhase: Double = 0
-
-    init() {
-        firstSamples.initialize(repeating: 0, count: 8)
-    }
-
-    deinit {
-        firstSamples.deallocate()
-    }
-}
-
 /// Snapshot of the running audio path, for display and per-device profiles.
 struct EngineStatus {
     let outputDeviceName: String
@@ -119,6 +87,9 @@ struct EngineStatus {
     let sampleRate: Double
     let tapFormatDescription: String
     let bufferFrameSize: UInt32
+    /// 1 for plain devices; the sub-device count for multi-output devices, where
+    /// the tap attenuates the mix by that factor and the IOProc restores it.
+    let tapCompensationGain: Float
 }
 
 /// Milestone 0 engine: muted global process tap + private aggregate device with a
@@ -132,7 +103,6 @@ final class AudioTapEngine {
     private let ioQueue = DispatchQueue(label: "com.jatingrewal.maceq.io", qos: .userInteractive)
 
     let stats = IOStats()
-    let probe = DebugProbe()
     let kernelHolder = KernelHolder()
     let convolverHolder = ConvolverHolder()
     let captureRing = CaptureRing()
@@ -282,26 +252,27 @@ final class AudioTapEngine {
 
             // 3. Passthrough IOProc on the aggregate. Must stay real-time safe:
             //    no allocation, no locks, no Objective-C/Swift runtime calls that lock.
+            // The process tap attenuates the captured mix by the sub-device count
+            // when the default output is a multi-output device; restore the level.
+            let compensationGain = Float(outputSubDeviceCount(of: outputDevice))
             let stats = self.stats
-            let probe = self.probe
             let kernelHolder = self.kernelHolder
             let convolverHolder = self.convolverHolder
             let captureRing = self.captureRing
             try checkOSStatus(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, ioQueue) {
                     _, inInputData, _, outOutputData, _ in
-                    if probe.toneEnabled {
-                        writeTestTone(output: outOutputData, sampleRate: sampleRate, probe: probe)
-                    } else {
-                        passthrough(input: inInputData, output: outOutputData, stats: stats, probe: probe)
-                        // Convolution before the EQ kernel so the kernel's limiter
-                        // stays last in the chain and still catches IR-induced overs.
-                        if let convolver = convolverHolder.convolver {
-                            applyConvolver(convolver, output: outOutputData)
-                        }
-                        if let kernel = kernelHolder.kernel {
-                            applyKernel(kernel, output: outOutputData)
-                        }
+                    passthrough(input: inInputData, output: outOutputData, stats: stats)
+                    if compensationGain != 1 {
+                        applyOutputGain(compensationGain, output: outOutputData)
+                    }
+                    // Convolution before the EQ kernel so the kernel's limiter
+                    // stays last in the chain and still catches IR-induced overs.
+                    if let convolver = convolverHolder.convolver {
+                        applyConvolver(convolver, output: outOutputData)
+                    }
+                    if let kernel = kernelHolder.kernel {
+                        applyKernel(kernel, output: outOutputData)
                     }
                     captureOutput(outOutputData, into: captureRing)
                 },
@@ -318,7 +289,8 @@ final class AudioTapEngine {
                 outputDeviceUID: outputUID,
                 sampleRate: sampleRate,
                 tapFormatDescription: describe(format: tapFormat),
-                bufferFrameSize: bufferFrames
+                bufferFrameSize: bufferFrames,
+                tapCompensationGain: compensationGain
             )
             stats.consecutiveZeroBuffers = 0
             addSampleRateListener(to: outputDevice, startedAt: sampleRate)
@@ -488,33 +460,10 @@ private func applyKernel(_ kernel: EQKernel, output: UnsafeMutablePointer<AudioB
 private func passthrough(
     input: UnsafePointer<AudioBufferList>,
     output: UnsafeMutablePointer<AudioBufferList>,
-    stats: IOStats,
-    probe: DebugProbe
+    stats: IOStats
 ) {
     let inputBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
     let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
-
-    if !probe.layoutCaptured {
-        probe.inputBufferCount = UInt32(inputBuffers.count)
-        probe.outputBufferCount = UInt32(outputBuffers.count)
-        if let first = inputBuffers.first {
-            probe.inputChannels = first.mNumberChannels
-            probe.inputByteSize = first.mDataByteSize
-        }
-        if let first = outputBuffers.first {
-            probe.outputChannels = first.mNumberChannels
-            probe.outputByteSize = first.mDataByteSize
-        }
-        probe.layoutCaptured = true
-    }
-
-    if let first = inputBuffers.first, let data = first.mData {
-        let samples = data.assumingMemoryBound(to: Float.self)
-        let available = min(8, Int(first.mDataByteSize) / MemoryLayout<Float>.size)
-        for i in 0..<available {
-            probe.firstSamples[i] = samples[i]
-        }
-    }
 
     var peak: Float = 0
     var sumOfSquares: Float = 0
@@ -541,10 +490,6 @@ private func passthrough(
         framesThisCallback += UInt64(count) / UInt64(channels)
     }
 
-    if peak > Float(bitPattern: probe.maxSampleEverBits) {
-        probe.maxSampleEverBits = peak.bitPattern
-    }
-
     stats.callbackCount &+= 1
     stats.framesProcessed &+= framesThisCallback
     stats.lastPeakBits = peak.bitPattern
@@ -556,34 +501,16 @@ private func passthrough(
     }
 }
 
-/// Debug: fills every output buffer with a 440 Hz sine at -20 dBFS, ignoring input.
-/// Isolates the aggregate -> output-device path from the tap -> input path.
-private func writeTestTone(
-    output: UnsafeMutablePointer<AudioBufferList>,
-    sampleRate: Double,
-    probe: DebugProbe
-) {
-    probe.toneCallbackCount &+= 1
+/// Multiplies every output buffer by a constant gain in place. Real-time safe.
+/// Compensates the process tap's multi-output attenuation.
+private func applyOutputGain(_ gain: Float, output: UnsafeMutablePointer<AudioBufferList>) {
+    var gainValue = gain
     let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
-    let phaseIncrement = 2.0 * Double.pi * 440.0 / sampleRate
-    let amplitude: Float = 0.1
-
     for buffer in outputBuffers {
         guard let data = buffer.mData else { continue }
         let samples = data.assumingMemoryBound(to: Float.self)
         let sampleCount = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
-        let channels = Int(max(buffer.mNumberChannels, 1))
-        var phase = probe.tonePhase
-        var index = 0
-        while index + channels <= sampleCount {
-            let value = amplitude * Float(sin(phase))
-            for channel in 0..<channels {
-                samples[index + channel] = value
-            }
-            phase += phaseIncrement
-            index += channels
-        }
-        probe.tonePhase = phase.truncatingRemainder(dividingBy: 2.0 * Double.pi)
+        vDSP_vsmul(samples, 1, &gainValue, samples, 1, vDSP_Length(sampleCount))
     }
 }
 

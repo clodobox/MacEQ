@@ -4,15 +4,27 @@ A free, open-source, native macOS menu-bar system-wide equalizer built on Apple'
 Core Audio process-tap API (macOS 14.4+). No virtual audio driver, no admin
 password, volume keys keep working.
 
-## Status: Milestone 0 — audio-path spike
+## Status: Milestone 3 complete
 
-Current build proves the core architecture with a straight passthrough (no EQ yet):
+Feature set:
 
-1. A **muted global process tap** captures the entire system mix and silences the
-   original stream.
-2. A **private aggregate device** wraps the tap plus the real default output device.
-3. A single **IOProc** on the aggregate reads the tapped mix and writes it back to
-   the output device unmodified.
+- 10-band graphic EQ and full parametric EQ (12 Equalizer APO filter types,
+  draggable response curve with live spectrum overlay)
+- Equalizer APO `config.txt` as the native preset format — AutoEQ profiles
+  import directly (paste, file, or text editor)
+- Per-output-device profiles that switch automatically
+- App exclude list (browser helper processes attributed to their apps)
+- Convolution/FIR room correction (partitioned overlap-save; WAV/AIFF impulse
+  responses, auto-resampled to the device rate)
+- Safety limiter, auto preamp, buffer-size control, launch at login
+- Global hotkey: Option+Command+E toggles the EQ from anywhere
+- Self-healing: follows default-device and sample-rate changes, zero-buffer
+  tap watchdog
+
+Architecture: a **muted global process tap** captures and silences the system
+mix, a **private aggregate device** pairs the tap with the real output device,
+and one **IOProc** runs convolution -> biquad cascade -> preamp -> limiter and
+writes to the output. No virtual driver, no admin password, volume keys work.
 
 ### Build and run
 
@@ -23,26 +35,18 @@ scripts/build-app.sh
 open build/MacEQ.app
 ```
 
-Click **Start passthrough**, grant the system-audio permission when prompted, and
-play music in any app.
-
-### Milestone 0 exit criteria
-
-- [ ] System audio plays through the passthrough unmodified.
-- [ ] Original stream is silenced — audio is heard exactly once, not doubled.
-- [ ] No glitches, dropouts, or pitch artifacts.
-- [ ] Purple recording indicator appears in the menu bar (expected, unavoidable).
-- [ ] Peak/RMS meters move with the audio (tap delivers real samples, not zeros).
-- [ ] Per-callback latency logged (IO buffer frames / sample rate).
+Grant the system-audio permission when prompted and play music in any app.
+Run the tests with `swift run maceq-tests`.
 
 ### Development notes
 
 - Ad-hoc signing means macOS re-asks for the audio-capture permission after every
   rebuild. Reset a stuck grant with:
   `tccutil reset SystemAudioCaptureRequests com.jatingrewal.maceq`
-- Known platform caveats being designed around: intermittent all-zero tap buffers
-  after long uptime (needs teardown/rebuild recovery), level attenuation on
-  multi-output interfaces, and sample-rate/Bluetooth renegotiation. See the PRD.
+- Known platform caveats and their mitigations: intermittent all-zero tap buffers
+  after long uptime (zero-buffer watchdog rebuilds the path), level attenuation on
+  multi-output devices (compensated in the IOProc), and sample-rate/Bluetooth
+  renegotiation (rate listener rebuilds the path).
 
 ## Roadmap
 
@@ -52,8 +56,9 @@ play music in any app.
 - **M2 (done):** parametric EQ (12 APO filter types, draggable response curve,
   band table), Equalizer APO `config.txt` as the native preset format, AutoEQ
   import (paste + file), per-device profiles, app exclude list, safety limiter.
-- **M3 (in progress):** spectrum analyzer overlay (done), latency/CPU display
-  (done), buffer-size control (done), launch-at-login (done); remaining:
-  convolution/FIR room correction, global hotkeys.
-- **Hardening (planned):** zero-buffer tap watchdog, multi-output attenuation
-  compensation, soak tests; Developer ID signing + notarization for distribution.
+- **M3 (done):** spectrum analyzer overlay, latency/CPU display, buffer-size
+  control, launch-at-login, convolution/FIR room correction, global bypass
+  hotkey; plus hardening: sample-rate follow and zero-buffer tap watchdog.
+- **Remaining (planned):** debug-instrumentation cleanup, multi-output
+  attenuation compensation, soak tests; Developer ID signing + notarization
+  for distribution.

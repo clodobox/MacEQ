@@ -8,7 +8,7 @@
 # with: tccutil reset SystemAudioCaptureRequests com.jatingrewal.maceq
 set -euo pipefail
 
-CONFIGURATION="${1:-debug}"
+CONFIGURATION="${1:-release}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/.build/$CONFIGURATION"
 APP_DIR="$PROJECT_DIR/build/MacEQ.app"
