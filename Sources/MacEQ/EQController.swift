@@ -293,7 +293,6 @@ final class EQController: ObservableObject {
             errorMessage = String(describing: error)
             engine.stop()
             isRunning = false
-            writeStatusSnapshot()
         }
     }
 
@@ -798,7 +797,6 @@ final class EQController: ObservableObject {
             ))
         }
         statusModel.diagnosticLines = lines + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
-        writeStatusSnapshot()
         checkZeroBufferWatchdog(status: status, stats: stats)
     }
 
@@ -813,22 +811,4 @@ final class EQController: ObservableObject {
         )]
     }
 
-    /// Debug aid: mirrors live state to a file so the audio path can be inspected
-    /// without reading the screen. Best-effort by design; kept through the soak
-    /// period to observe the zero-buffer watchdog, removed before distribution.
-    private func writeStatusSnapshot() {
-        let snapshot = """
-        timestamp: \(Date())
-        running: \(isRunning)
-        eqEnabled: \(eqEnabled)
-        gains: \(gains)
-        preamp: \(effectivePreampDB) (auto: \(autoPreampEnabled))
-        error: \(errorMessage ?? "none")
-        status: \(statusModel.summary)
-        watchdog: \(watchdogRestartCount) restarts\(lastWatchdogRestart.map { ", last \($0)" } ?? "")
-        \(statusModel.diagnosticLines.joined(separator: "\n"))
-        """
-        try? (snapshot + "\nexcluded: \(excludedBundleIDs.sorted())")
-            .write(toFile: "/tmp/maceq-spike-status.txt", atomically: true, encoding: .utf8)
-    }
 }

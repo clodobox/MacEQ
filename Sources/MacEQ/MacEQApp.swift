@@ -36,6 +36,11 @@ struct MacEQApp: App {
             PresetNameView(controller: AppDelegate.controller)
         }
         .windowResizability(.contentSize)
+
+        Window("About MacEQ", id: "about") {
+            AboutView()
+        }
+        .windowResizability(.contentSize)
     }
 }
 
@@ -155,6 +160,10 @@ struct EQPopoverView: View {
                     Button("Start Audio Engine") { controller.start() }
                 }
                 Divider()
+                Button("About MacEQ") {
+                    openWindow(id: "about")
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
                 Button("Quit MacEQ") { NSApplication.shared.terminate(nil) }
             } label: {
                 Image(systemName: "ellipsis.circle")
