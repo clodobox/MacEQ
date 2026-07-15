@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import MacEQCore
 
@@ -467,9 +468,210 @@ func testSpectrumAnalyzerFindsSine() {
     expect(spectrum[44] < -60, "high bands near noise floor, got \(spectrum[44])")
 }
 
+// MARK: - FIR convolver (uniform partitioned overlap-save)
+
+/// Deterministic pseudo-random signal in [-1, 1] (LCG; tests must not flake).
+func pseudoRandomSignal(count: Int, seed: UInt64) -> [Float] {
+    var state = seed
+    return (0..<count).map { _ in
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return Float(Double(state >> 33) / Double(UInt32.max >> 1)) * 2 - 1
+    }
+}
+
+/// O(N*L) time-domain reference convolution, accumulated in Double.
+func directConvolution(input: [Float], impulseResponse: [Float]) -> [Float] {
+    var output = [Float](repeating: 0, count: input.count)
+    for n in input.indices {
+        var sum = 0.0
+        for k in 0...min(n, impulseResponse.count - 1) {
+            sum += Double(impulseResponse[k]) * Double(input[n - k])
+        }
+        output[n] = Float(sum)
+    }
+    return output
+}
+
+/// Feeds an interleaved buffer through the convolver in uneven chunks, in place.
+func convolveChunked(
+    _ convolver: FIRConvolver, buffer: inout [Float], chunks: [Int], channelCount: Int
+) {
+    var offset = 0
+    buffer.withUnsafeMutableBufferPointer { pointer in
+        for chunk in chunks {
+            convolver.process(
+                interleaved: pointer.baseAddress! + offset * channelCount,
+                frameCount: chunk,
+                channelCount: channelCount
+            )
+            offset += chunk
+        }
+    }
+}
+
+func testConvolverDeltaIsDelayedIdentity() {
+    let blockSize = 64
+    guard let convolver = FIRConvolver(
+        impulseResponse: [[1.0]], blockSize: blockSize, maxChannels: 1
+    ) else {
+        expect(false, "delta convolver construction failed")
+        return
+    }
+    expect(convolver.latencyFrames == blockSize, "latency is one block")
+    let original = (0..<400).map { Float($0 + 1) }
+    var buffer = original
+    convolveChunked(convolver, buffer: &buffer, chunks: [7, 64, 100, 129, 100], channelCount: 1)
+    for index in 0..<blockSize {
+        expectClose(Double(buffer[index]), 0, tolerance: 1e-3, "priming zeros at \(index)")
+    }
+    for index in blockSize..<400 {
+        expectClose(
+            Double(buffer[index]), Double(original[index - blockSize]),
+            tolerance: 0.05, "delayed identity at \(index)"
+        )
+    }
+}
+
+func testConvolverMatchesDirectConvolution() {
+    let blockSize = 64
+    // IR longer than 3 partitions and not block-aligned, so the frequency-domain
+    // delay line and zero-padding paths are all exercised.
+    let impulseResponse = pseudoRandomSignal(count: 3 * blockSize + 7, seed: 12345)
+    guard let convolver = FIRConvolver(
+        impulseResponse: [impulseResponse], blockSize: blockSize, maxChannels: 1
+    ) else {
+        expect(false, "random-IR convolver construction failed")
+        return
+    }
+    let input = pseudoRandomSignal(count: 1024, seed: 99)
+    let expected = directConvolution(input: input, impulseResponse: impulseResponse)
+    var buffer = input
+    convolveChunked(convolver, buffer: &buffer, chunks: [1, 63, 64, 96, 300, 500], channelCount: 1)
+    var maxError = 0.0
+    for index in blockSize..<1024 {
+        maxError = max(maxError, abs(Double(buffer[index]) - Double(expected[index - blockSize])))
+    }
+    expect(maxError < 5e-3, "partitioned convolution matches direct within 5e-3, max error \(maxError)")
+}
+
+func testConvolverStereoUsesPerChannelIR() {
+    let blockSize = 64
+    let extraDelay = 10
+    var leftIR = [Float](repeating: 0, count: extraDelay + 1)
+    leftIR[0] = 1
+    var rightIR = [Float](repeating: 0, count: extraDelay + 1)
+    rightIR[extraDelay] = 1
+    guard let convolver = FIRConvolver(
+        impulseResponse: [leftIR, rightIR], blockSize: blockSize, maxChannels: 2
+    ) else {
+        expect(false, "stereo convolver construction failed")
+        return
+    }
+    let frames = 300
+    let left = (0..<frames).map { Float($0 + 1) }
+    let right = (0..<frames).map { Float(1000 - $0) }
+    var buffer = [Float](repeating: 0, count: frames * 2)
+    for frame in 0..<frames {
+        buffer[frame * 2] = left[frame]
+        buffer[frame * 2 + 1] = right[frame]
+    }
+    convolveChunked(convolver, buffer: &buffer, chunks: [128, 100, 72], channelCount: 2)
+    for frame in blockSize..<frames {
+        expectClose(
+            Double(buffer[frame * 2]), Double(left[frame - blockSize]),
+            tolerance: 0.05, "left channel delayed by block at \(frame)"
+        )
+    }
+    for frame in (blockSize + extraDelay)..<frames {
+        expectClose(
+            Double(buffer[frame * 2 + 1]), Double(right[frame - blockSize - extraDelay]),
+            tolerance: 0.05, "right channel delayed by block+IR at \(frame)"
+        )
+    }
+}
+
+func testConvolverRejectsInvalidConstruction() {
+    expect(
+        FIRConvolver(impulseResponse: [], blockSize: 64, maxChannels: 2) == nil,
+        "empty IR rejected"
+    )
+    expect(
+        FIRConvolver(impulseResponse: [[]], blockSize: 64, maxChannels: 2) == nil,
+        "zero-length IR rejected"
+    )
+    expect(
+        FIRConvolver(impulseResponse: [[1]], blockSize: 100, maxChannels: 2) == nil,
+        "non-power-of-two block size rejected"
+    )
+    expect(
+        FIRConvolver(impulseResponse: [[1], [1], [1]], blockSize: 64, maxChannels: 2) == nil,
+        "IR channel count beyond maxChannels rejected"
+    )
+    expect(
+        FIRConvolver(impulseResponse: [[1], [1, 0]], blockSize: 64, maxChannels: 2) == nil,
+        "mismatched IR channel lengths rejected"
+    )
+}
+
+// MARK: - Impulse response loading
+
+func testImpulseResponseLoaderRoundTripAndResample() {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("maceq-test-ir-\(ProcessInfo.processInfo.processIdentifier).wav")
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    guard let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false
+    ), let writeBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480) else {
+        expect(false, "test WAV format construction failed")
+        return
+    }
+    writeBuffer.frameLength = 480
+    for index in 0..<480 {
+        writeBuffer.floatChannelData![0][index] = Float(index) / 480
+    }
+    do {
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        try file.write(from: writeBuffer)
+    } catch {
+        expect(false, "test WAV write failed: \(error)")
+        return
+    }
+
+    do {
+        let sameRate = try loadImpulseResponse(url: url, sampleRate: 48000)
+        expect(sameRate.count == 1, "mono file loads one channel")
+        expect(sameRate[0].count == 480, "same-rate load keeps length, got \(sameRate[0].count)")
+        expectClose(Double(sameRate[0][240]), 0.5, tolerance: 1e-4, "sample values survive round trip")
+
+        let resampled = try loadImpulseResponse(url: url, sampleRate: 24000)
+        expect(
+            abs(resampled[0].count - 240) <= 32,
+            "half-rate load halves length, got \(resampled[0].count)"
+        )
+    } catch {
+        expect(false, "impulse response load failed: \(error)")
+    }
+
+    do {
+        _ = try loadImpulseResponse(
+            url: FileManager.default.temporaryDirectory.appendingPathComponent("maceq-missing.wav"),
+            sampleRate: 48000
+        )
+        expect(false, "missing file should throw")
+    } catch {
+        expect(true, "missing file throws")
+    }
+}
+
 testLimiterCatchesOvers()
 testLimiterTransparentBelowThreshold()
 testSpectrumAnalyzerFindsSine()
+testConvolverDeltaIsDelayedIdentity()
+testConvolverMatchesDirectConvolution()
+testConvolverStereoUsesPerChannelIR()
+testConvolverRejectsInvalidConstruction()
+testImpulseResponseLoaderRoundTripAndResample()
 
 if failureCount > 0 {
     print("\(failureCount) of \(expectationCount) expectations FAILED")

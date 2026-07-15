@@ -91,6 +91,14 @@ struct EQPopoverView: View {
                     NSApplication.shared.activate(ignoringOtherApps: true)
                 }
                 Divider()
+                if let irName = controller.impulseResponseName {
+                    Toggle("Convolution (\(irName))", isOn: $controller.convolutionEnabled)
+                    Button("Replace Impulse Response…") { controller.chooseImpulseResponse() }
+                    Button("Clear Impulse Response") { controller.clearImpulseResponse() }
+                } else {
+                    Button("Load Impulse Response…") { controller.chooseImpulseResponse() }
+                }
+                Divider()
                 Button("Import Preset…") { controller.importPresetFromFile() }
                 Button("Export Preset…") { controller.exportPresetToFile() }
                 Divider()

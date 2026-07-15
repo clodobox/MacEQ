@@ -33,6 +33,9 @@ struct DeviceProfile: Codable {
     var manualPreampDB: Double
     var autoPreampEnabled: Bool
     var eqEnabled: Bool
+    // Optional so profiles saved before convolution existed still decode.
+    var impulseResponsePath: String?
+    var convolutionEnabled: Bool?
 }
 
 /// Live spectrum levels, kept out of EQController on purpose: the popover
@@ -87,6 +90,16 @@ final class EQController: ObservableObject {
     }
     /// Last parse error from the config text editor, shown inline.
     @Published var configParseError: String?
+    @Published var convolutionEnabled: Bool {
+        didSet {
+            guard !isApplyingProfile else { return }
+            defaults.set(convolutionEnabled, forKey: "convolutionEnabled")
+            saveProfileForCurrentDevice()
+            rebuildConvolver()
+        }
+    }
+    /// Display name of the loaded impulse response file, nil when none is set.
+    @Published private(set) var impulseResponseName: String?
 
     @Published private(set) var isRunning = false
     @Published private(set) var errorMessage: String?
@@ -132,6 +145,10 @@ final class EQController: ObservableObject {
     /// release is never the final one (final release may free memory, which is
     /// forbidden on the real-time thread).
     private var retiredKernels: [EQKernel] = []
+    private var retiredConvolvers: [FIRConvolver] = []
+    private var impulseResponseURL: URL?
+    /// One block of added latency; 512 frames ≈ 10.7 ms at 48 kHz.
+    static let convolutionBlockSize = 512
     private var pollTimer: Timer?
     private let defaults = UserDefaults.standard
     /// Suppresses persistence/kernel rebuilds while a device profile is being applied.
@@ -159,6 +176,11 @@ final class EQController: ObservableObject {
 
         excludedBundleIDs = Set(defaults.stringArray(forKey: "excludedBundleIDs") ?? [])
         bufferFrames = defaults.object(forKey: "bufferFrames") as? Int ?? 0
+        convolutionEnabled = defaults.object(forKey: "convolutionEnabled") as? Bool ?? false
+        if let path = defaults.string(forKey: "impulseResponsePath") {
+            impulseResponseURL = URL(fileURLWithPath: path)
+            impulseResponseName = (path as NSString).lastPathComponent
+        }
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
         engine.onDefaultOutputDeviceChanged = { [weak self] in
@@ -239,6 +261,7 @@ final class EQController: ObservableObject {
             isRunning = true
             loadProfileForCurrentDevice()
             rebuildKernel()
+            rebuildConvolver()
             startPolling()
         } catch {
             errorMessage = String(describing: error)
@@ -252,6 +275,8 @@ final class EQController: ObservableObject {
         pollTimer?.invalidate()
         pollTimer = nil
         engine.kernelHolder.kernel = nil
+        retireConvolver(engine.convolverHolder.convolver)
+        engine.convolverHolder.convolver = nil
         engine.stop()
         isRunning = false
         statusSummary = "Not running"
@@ -291,7 +316,9 @@ final class EQController: ObservableObject {
             parametricConfig: serializeAPOConfig(EQPreset(preampDB: manualPreampDB, filters: parametricFilters)),
             manualPreampDB: manualPreampDB,
             autoPreampEnabled: autoPreampEnabled,
-            eqEnabled: eqEnabled
+            eqEnabled: eqEnabled,
+            impulseResponsePath: impulseResponseURL?.path,
+            convolutionEnabled: convolutionEnabled
         )
         do {
             defaults.set(try JSONEncoder().encode(profiles), forKey: "deviceProfiles")
@@ -319,6 +346,14 @@ final class EQController: ObservableObject {
         if let preset = try? parseAPOConfig(profile.parametricConfig) {
             parametricFilters = preset.filters
         }
+        if let path = profile.impulseResponsePath {
+            impulseResponseURL = URL(fileURLWithPath: path)
+            impulseResponseName = (path as NSString).lastPathComponent
+        } else {
+            impulseResponseURL = nil
+            impulseResponseName = nil
+        }
+        convolutionEnabled = profile.convolutionEnabled ?? false
     }
 
     private func persist() {
@@ -400,6 +435,70 @@ final class EQController: ObservableObject {
             try currentConfigText().write(to: url, atomically: true, encoding: .utf8)
         } catch {
             errorMessage = "Could not write \(url.lastPathComponent): \(error)"
+        }
+    }
+
+    // MARK: - Convolution
+
+    /// Picks an impulse response file (room correction / headphone FIR) and
+    /// enables convolution with it.
+    func chooseImpulseResponse() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose an impulse response (WAV, AIFF, ...)"
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        impulseResponseURL = url
+        impulseResponseName = url.lastPathComponent
+        defaults.set(url.path, forKey: "impulseResponsePath")
+        // Assigning triggers didSet even for the same value: persists, saves the
+        // device profile, and rebuilds the convolver with the new file.
+        convolutionEnabled = true
+    }
+
+    func clearImpulseResponse() {
+        impulseResponseURL = nil
+        impulseResponseName = nil
+        defaults.removeObject(forKey: "impulseResponsePath")
+        convolutionEnabled = false
+    }
+
+    /// Loads the IR at the engine's sample rate and swaps a fresh convolver in.
+    /// Separate from rebuildKernel on purpose: kernel rebuilds happen on every
+    /// slider tick and must not re-FFT a 100k-tap impulse response each time.
+    private func rebuildConvolver() {
+        guard isRunning, convolutionEnabled, let url = impulseResponseURL else {
+            retireConvolver(engine.convolverHolder.convolver)
+            engine.convolverHolder.convolver = nil
+            return
+        }
+        let sampleRate = engine.status?.sampleRate ?? 48000
+        do {
+            let impulseResponse = try loadImpulseResponse(url: url, sampleRate: sampleRate)
+            guard let convolver = FIRConvolver(
+                impulseResponse: impulseResponse,
+                blockSize: Self.convolutionBlockSize,
+                maxChannels: 2
+            ) else {
+                errorMessage = "Convolver construction failed (\(url.lastPathComponent), \(impulseResponse.first?.count ?? 0) frames at \(sampleRate) Hz)"
+                return
+            }
+            retireConvolver(engine.convolverHolder.convolver)
+            engine.convolverHolder.convolver = convolver
+            errorMessage = nil
+        } catch {
+            errorMessage = String(describing: error)
+            retireConvolver(engine.convolverHolder.convolver)
+            engine.convolverHolder.convolver = nil
+        }
+    }
+
+    private func retireConvolver(_ convolver: FIRConvolver?) {
+        guard let convolver else { return }
+        retiredConvolvers.append(convolver)
+        if retiredConvolvers.count > 4 {
+            retiredConvolvers.removeFirst(retiredConvolvers.count - 4)
         }
     }
 
@@ -578,9 +677,20 @@ final class EQController: ObservableObject {
             String(format: "Peak: %.1f dBFS", peakDB),
             "Callbacks: \(stats.callbackCount), silent streak: \(stats.consecutiveZeroBuffers)",
             "Watchdog restarts: \(watchdogRestartCount)",
-        ] + engine.diagnostics()
+        ] + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
         writeStatusSnapshot()
         checkZeroBufferWatchdog(status: status, stats: stats)
+    }
+
+    private func convolutionDiagnostics(sampleRate: Double) -> [String] {
+        guard let convolver = engine.convolverHolder.convolver else { return [] }
+        return [String(
+            format: "Convolution: %@ · %d taps · %d partitions · +%.1f ms",
+            impulseResponseName ?? "?",
+            convolver.irFrameCount,
+            convolver.partitionCount,
+            Double(convolver.latencyFrames) / sampleRate * 1000
+        )]
     }
 
     /// Debug aid: mirrors live state to a file so the audio path can be inspected

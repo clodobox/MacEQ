@@ -10,6 +10,13 @@ final class KernelHolder {
     var kernel: EQKernel?
 }
 
+/// Hands the active FIR convolver to the audio thread; nil means no convolution.
+/// Same lifetime rules as KernelHolder: the owner retires replaced convolvers so
+/// the audio thread's reference release is never the final one.
+final class ConvolverHolder {
+    var convolver: FIRConvolver?
+}
+
 /// Single-writer ring of post-EQ mono samples for the spectrum display.
 /// The audio thread writes, the UI thread snapshots; occasional torn reads are
 /// harmless for visualization, so no synchronization is used.
@@ -127,6 +134,7 @@ final class AudioTapEngine {
     let stats = IOStats()
     let probe = DebugProbe()
     let kernelHolder = KernelHolder()
+    let convolverHolder = ConvolverHolder()
     let captureRing = CaptureRing()
     private(set) var status: EngineStatus?
 
@@ -277,6 +285,7 @@ final class AudioTapEngine {
             let stats = self.stats
             let probe = self.probe
             let kernelHolder = self.kernelHolder
+            let convolverHolder = self.convolverHolder
             let captureRing = self.captureRing
             try checkOSStatus(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, ioQueue) {
@@ -285,6 +294,11 @@ final class AudioTapEngine {
                         writeTestTone(output: outOutputData, sampleRate: sampleRate, probe: probe)
                     } else {
                         passthrough(input: inInputData, output: outOutputData, stats: stats, probe: probe)
+                        // Convolution before the EQ kernel so the kernel's limiter
+                        // stays last in the chain and still catches IR-induced overs.
+                        if let convolver = convolverHolder.convolver {
+                            applyConvolver(convolver, output: outOutputData)
+                        }
                         if let kernel = kernelHolder.kernel {
                             applyKernel(kernel, output: outOutputData)
                         }
@@ -437,6 +451,21 @@ private func captureOutput(_ output: UnsafeMutablePointer<AudioBufferList>, into
         frameCount: sampleCount / channels,
         channelCount: channels
     )
+}
+
+/// Runs the FIR convolver in place on every output buffer. Real-time safe.
+private func applyConvolver(_ convolver: FIRConvolver, output: UnsafeMutablePointer<AudioBufferList>) {
+    let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
+    for buffer in outputBuffers {
+        guard let data = buffer.mData else { continue }
+        let channels = Int(max(buffer.mNumberChannels, 1))
+        let sampleCount = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+        convolver.process(
+            interleaved: data.assumingMemoryBound(to: Float.self),
+            frameCount: sampleCount / channels,
+            channelCount: channels
+        )
+    }
 }
 
 /// Runs the EQ kernel in place on every output buffer. Real-time safe.
