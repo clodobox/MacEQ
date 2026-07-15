@@ -176,7 +176,10 @@ struct ResponseCurveView: View {
             ZStack {
                 Canvas { context, canvasSize in
                     drawGrid(context: context, size: canvasSize)
-                    drawSpectrum(context: context, size: canvasSize)
+                }
+                SpectrumOverlay(spectrum: controller.spectrum)
+                    .allowsHitTesting(false)
+                Canvas { context, canvasSize in
                     drawCurve(context: context, size: canvasSize)
                 }
                 ForEach(controller.parametricFilters.indices, id: \.self) { index in
@@ -264,28 +267,6 @@ struct ResponseCurveView: View {
         }
     }
 
-    /// Live output spectrum, drawn as a translucent filled skyline behind the
-    /// response curve. Spectrum dBFS (-80..0) maps onto the full plot height —
-    /// a different scale than the response dB axis, purely for visualization.
-    private func drawSpectrum(context: GraphicsContext, size: CGSize) {
-        let spectrum = controller.spectrumDB
-        guard spectrum.count == EQController.spectrumBands.count else { return }
-        let floorDB = -80.0
-        var path = Path()
-        path.move(to: CGPoint(x: 0, y: size.height))
-        for (index, band) in EQController.spectrumBands.enumerated() {
-            let fraction = max(0, min(1, (spectrum[index] - floorDB) / -floorDB))
-            let point = CGPoint(
-                x: xPosition(frequency: band, width: size.width),
-                y: size.height * CGFloat(1 - fraction)
-            )
-            path.addLine(to: point)
-        }
-        path.addLine(to: CGPoint(x: size.width, y: size.height))
-        path.closeSubpath()
-        context.fill(path, with: .color(.blue.opacity(0.15)))
-    }
-
     private func drawCurve(context: GraphicsContext, size: CGSize) {
         let sampleRate = controller.currentSampleRate
         let cascade = controller.parametricFilters
@@ -346,5 +327,39 @@ struct ResponseCurveView: View {
 
     private func distance(from a: CGPoint, to b: CGPoint) -> CGFloat {
         hypot(a.x - b.x, a.y - b.y)
+    }
+}
+
+/// Live output spectrum, drawn as a translucent filled skyline behind the
+/// response curve. Spectrum dBFS (-80..0) maps onto the full plot height —
+/// a different scale than the response dB axis, purely for visualization.
+///
+/// A separate view on purpose: it alone observes SpectrumModel, so the 20 fps
+/// updates redraw only this canvas instead of the whole popover.
+private struct SpectrumOverlay: View {
+    @ObservedObject var spectrum: SpectrumModel
+
+    private let freqRange: ClosedRange<Double> = 20...20000
+
+    var body: some View {
+        Canvas { context, size in
+            let levels = spectrum.levelsDB
+            guard levels.count == EQController.spectrumBands.count else { return }
+            let floorDB = -80.0
+            var path = Path()
+            path.move(to: CGPoint(x: 0, y: size.height))
+            for (index, band) in EQController.spectrumBands.enumerated() {
+                let fraction = max(0, min(1, (levels[index] - floorDB) / -floorDB))
+                let logSpan = log(freqRange.upperBound / freqRange.lowerBound)
+                let point = CGPoint(
+                    x: CGFloat(log(band / freqRange.lowerBound) / logSpan) * size.width,
+                    y: size.height * CGFloat(1 - fraction)
+                )
+                path.addLine(to: point)
+            }
+            path.addLine(to: CGPoint(x: size.width, y: size.height))
+            path.closeSubpath()
+            context.fill(path, with: .color(.blue.opacity(0.15)))
+        }
     }
 }

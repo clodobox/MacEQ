@@ -35,6 +35,14 @@ struct DeviceProfile: Codable {
     var eqEnabled: Bool
 }
 
+/// Live spectrum levels, kept out of EQController on purpose: the popover
+/// observes the controller, so publishing 20 fps spectrum frames there re-rendered
+/// the entire popover (~99% CPU). Only the spectrum overlay observes this.
+@MainActor
+final class SpectrumModel: ObservableObject {
+    @Published var levelsDB: [Double] = []
+}
+
 /// UI-facing state for the 10-band graphic EQ. Owns the audio engine, rebuilds
 /// the DSP kernel on every change, persists settings, and mirrors status for
 /// debugging. Main-actor: all mutations come from the UI or main-queue callbacks.
@@ -85,7 +93,7 @@ final class EQController: ObservableObject {
     @Published private(set) var statusSummary = "Not running"
     @Published private(set) var diagnosticLines: [String] = []
     @Published private(set) var effectivePreampDB: Double = 0
-    @Published private(set) var spectrumDB: [Double] = []
+    let spectrum = SpectrumModel()
     @Published private(set) var cpuPercent: Double = 0
     @Published var bufferFrames: Int {
         didSet {
@@ -158,6 +166,9 @@ final class EQController: ObservableObject {
         }
         engine.onProcessListChanged = { [weak self] in
             self?.scheduleExclusionRecheck()
+        }
+        engine.onSampleRateChanged = { [weak self] in
+            self?.handleDeviceChange()
         }
     }
 
@@ -444,11 +455,50 @@ final class EQController: ObservableObject {
         }
     }
 
-    /// Tears down and rebuilds the audio path on the new default output device.
+    /// Tears down and rebuilds the audio path on the new default output device
+    /// (also used for sample-rate renegotiation on the same device).
     private func handleDeviceChange() {
         guard isRunning else { return }
         stop()
         start()
+    }
+
+    // MARK: - Zero-buffer watchdog
+
+    /// The documented process-tap platform bug: after long uptime the tap starts
+    /// delivering all-zero buffers even though apps are playing. Genuine silence is
+    /// indistinguishable from the bug at the buffer level, so the tap silence is
+    /// cross-checked against Core Audio's process list — if another (non-excluded)
+    /// process has IO running while the tap has been silent for ~3 s, rebuild the
+    /// path. A false positive only restarts during real silence, which is inaudible.
+    private var lastWatchdogRestart: Date?
+    private var watchdogRestartCount = 0
+
+    private func checkZeroBufferWatchdog(status: EngineStatus, stats: IOStats) {
+        let callbacksPerSecond = status.sampleRate / Double(max(status.bufferFrameSize, 1))
+        guard Double(stats.consecutiveZeroBuffers) > 3 * callbacksPerSecond else { return }
+        if let lastWatchdogRestart, Date().timeIntervalSince(lastWatchdogRestart) < 30 { return }
+        guard otherAudioProcessIsPlaying() else { return }
+        watchdogRestartCount += 1
+        lastWatchdogRestart = Date()
+        stop()
+        start()
+    }
+
+    /// True when any audio process other than ourselves and the excluded apps has
+    /// IO running. Best-effort: an unreadable process list just means no restart.
+    private func otherAudioProcessIsPlaying() -> Bool {
+        guard let objects = try? audioProcessObjectIDs() else { return false }
+        let selfPID = getpid()
+        for object in objects {
+            guard let processPID = try? pid(ofAudioProcess: object),
+                  processPID != selfPID,
+                  !lastExcludedPIDs.contains(processPID),
+                  (try? audioProcessIsRunning(object)) == true
+            else { continue }
+            return true
+        }
+        return false
     }
 
     // MARK: - Spectrum display
@@ -457,14 +507,14 @@ final class EQController: ObservableObject {
     private let analyzer = SpectrumAnalyzer(fftSize: 2048)
     private var spectrumTimer: Timer?
 
-    /// ~30 fps spectrum updates; runs only while a curve view is visible.
+    /// ~20 fps spectrum updates; runs only while a curve view is visible.
     func startSpectrum() {
         guard spectrumTimer == nil else { return }
-        spectrumTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        spectrumTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 guard let analyzer = self.analyzer, self.isRunning else { return }
-                self.spectrumDB = analyzer.bandMagnitudesDB(
+                self.spectrum.levelsDB = analyzer.bandMagnitudesDB(
                     samples: self.engine.captureRing.latest(analyzer.fftSize),
                     sampleRate: self.currentSampleRate,
                     bandFrequencies: Self.spectrumBands
@@ -476,7 +526,7 @@ final class EQController: ObservableObject {
     func stopSpectrum() {
         spectrumTimer?.invalidate()
         spectrumTimer = nil
-        spectrumDB = []
+        spectrum.levelsDB = []
     }
 
     // MARK: - CPU usage
@@ -527,8 +577,10 @@ final class EQController: ObservableObject {
             String(format: "IO buffer: %u frames (~%.1f ms)", status.bufferFrameSize, Double(status.bufferFrameSize) / status.sampleRate * 1000),
             String(format: "Peak: %.1f dBFS", peakDB),
             "Callbacks: \(stats.callbackCount), silent streak: \(stats.consecutiveZeroBuffers)",
+            "Watchdog restarts: \(watchdogRestartCount)",
         ] + engine.diagnostics()
         writeStatusSnapshot()
+        checkZeroBufferWatchdog(status: status, stats: stats)
     }
 
     /// Debug aid: mirrors live state to a file so the audio path can be inspected

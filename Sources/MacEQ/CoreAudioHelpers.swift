@@ -204,6 +204,20 @@ func pid(ofAudioProcess objectID: AudioObjectID) throws -> pid_t {
     return processPID
 }
 
+/// Whether an audio process has IO running right now (actively playing/recording).
+/// Drives the zero-buffer watchdog: a silent tap while another process is running
+/// IO indicates the known tap-goes-silent platform bug, not genuine silence.
+func audioProcessIsRunning(_ objectID: AudioObjectID) throws -> Bool {
+    var address = propertyAddress(kAudioProcessPropertyIsRunning)
+    var running: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    try checkOSStatus(
+        AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &running),
+        "AudioObjectGetPropertyData(kAudioProcessPropertyIsRunning, object \(objectID))"
+    )
+    return running != 0
+}
+
 /// The bundle ID Core Audio records for an audio process (works for helper
 /// processes that NSRunningApplication cannot see).
 func bundleID(ofAudioProcess objectID: AudioObjectID) throws -> String {

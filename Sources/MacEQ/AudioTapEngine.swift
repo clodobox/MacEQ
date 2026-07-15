@@ -135,6 +135,11 @@ final class AudioTapEngine {
     /// Called on the main queue when Core Audio's process list changes (an app
     /// started/stopped doing audio). Owners re-check the exclude list on this.
     var onProcessListChanged: (() -> Void)?
+    /// Called on the main queue when the active output device renegotiates its
+    /// nominal sample rate while running (e.g. 44.1 <-> 48 kHz on Bluetooth).
+    /// Filter coefficients are rate-dependent, so owners must restart on this.
+    /// Fires only when the new rate actually differs from the rate at start.
+    var onSampleRateChanged: (() -> Void)?
     /// Core Audio process objects to exclude from the tap (beyond our own process,
     /// always excluded). Set before start(). Owners resolve these from the exclude
     /// list and rebuild on onProcessListChanged when the set changes.
@@ -144,6 +149,8 @@ final class AudioTapEngine {
     var preferredBufferFrames: UInt32 = 0
     private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
     private var processListenerBlock: AudioObjectPropertyListenerBlock?
+    private var sampleRateListenerBlock: AudioObjectPropertyListenerBlock?
+    private var sampleRateListenerDevice = AudioObjectID(kAudioObjectUnknown)
 
     var isRunning: Bool { ioProcID != nil }
 
@@ -299,6 +306,8 @@ final class AudioTapEngine {
                 tapFormatDescription: describe(format: tapFormat),
                 bufferFrameSize: bufferFrames
             )
+            stats.consecutiveZeroBuffers = 0
+            addSampleRateListener(to: outputDevice, startedAt: sampleRate)
         } catch {
             // Unwind anything built before the failure so a retry starts clean.
             stop()
@@ -324,8 +333,52 @@ final class AudioTapEngine {
         return lines
     }
 
+    private func sampleRateListenerAddress() -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    private func addSampleRateListener(to deviceID: AudioObjectID, startedAt startRate: Double) {
+        var address = sampleRateListenerAddress()
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            // Property notifications can fire without an actual value change;
+            // restarting the whole path on a no-op notification would loop.
+            let newRate = (try? nominalSampleRate(of: deviceID)) ?? startRate
+            if newRate != startRate {
+                self.onSampleRateChanged?()
+            }
+        }
+        let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
+        if status == noErr {
+            sampleRateListenerBlock = block
+            sampleRateListenerDevice = deviceID
+        } else {
+            // Non-fatal: EQ still works, but a mid-session rate switch leaves
+            // stale coefficients until the next restart.
+            print("warning: sample-rate listener failed with OSStatus \(status)")
+        }
+    }
+
+    private func removeSampleRateListener() {
+        guard let sampleRateListenerBlock else { return }
+        var address = sampleRateListenerAddress()
+        AudioObjectRemovePropertyListenerBlock(
+            sampleRateListenerDevice,
+            &address,
+            DispatchQueue.main,
+            sampleRateListenerBlock
+        )
+        self.sampleRateListenerBlock = nil
+        sampleRateListenerDevice = AudioObjectID(kAudioObjectUnknown)
+    }
+
     /// Teardown in the required order: stop -> destroy IOProc -> destroy aggregate -> destroy tap.
     func stop() {
+        removeSampleRateListener()
         if let ioProcID {
             AudioDeviceStop(aggregateID, ioProcID)
             AudioDeviceDestroyIOProcID(aggregateID, ioProcID)
