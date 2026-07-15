@@ -10,6 +10,51 @@ final class KernelHolder {
     var kernel: EQKernel?
 }
 
+/// Single-writer ring of post-EQ mono samples for the spectrum display.
+/// The audio thread writes, the UI thread snapshots; occasional torn reads are
+/// harmless for visualization, so no synchronization is used.
+final class CaptureRing {
+    static let capacity = 8192  // power of two
+    private let samples = UnsafeMutablePointer<Float>.allocate(capacity: CaptureRing.capacity)
+    private var writeIndex = 0
+
+    init() {
+        samples.initialize(repeating: 0, count: Self.capacity)
+    }
+
+    deinit {
+        samples.deallocate()
+    }
+
+    /// Averages interleaved channels to mono into the ring. Real-time safe.
+    func write(interleaved data: UnsafePointer<Float>, frameCount: Int, channelCount: Int) {
+        guard channelCount > 0 else { return }
+        let scale = 1.0 / Float(channelCount)
+        var index = writeIndex
+        for frame in 0..<frameCount {
+            var sum: Float = 0
+            let base = frame * channelCount
+            for channel in 0..<channelCount {
+                sum += data[base + channel]
+            }
+            samples[index] = sum * scale
+            index = (index + 1) & (Self.capacity - 1)
+        }
+        writeIndex = index
+    }
+
+    /// The most recent `count` samples in chronological order (UI thread).
+    func latest(_ count: Int) -> [Float] {
+        let clamped = min(count, Self.capacity)
+        var result = [Float](repeating: 0, count: clamped)
+        let end = writeIndex
+        for offset in 0..<clamped {
+            result[clamped - 1 - offset] = samples[(end - 1 - offset + Self.capacity) & (Self.capacity - 1)]
+        }
+        return result
+    }
+}
+
 /// Stats written by the real-time IO thread and polled by the UI.
 ///
 /// Real-time safety note: the IO thread does plain word-sized stores into these
@@ -82,6 +127,7 @@ final class AudioTapEngine {
     let stats = IOStats()
     let probe = DebugProbe()
     let kernelHolder = KernelHolder()
+    let captureRing = CaptureRing()
     private(set) var status: EngineStatus?
 
     /// Called on the main queue when the system default output device changes.
@@ -93,6 +139,9 @@ final class AudioTapEngine {
     /// always excluded). Set before start(). Owners resolve these from the exclude
     /// list and rebuild on onProcessListChanged when the set changes.
     var excludedProcessObjects: [AudioObjectID] = []
+    /// IO buffer size to request on the aggregate at start; 0 keeps the device default.
+    /// Smaller = lower latency, higher CPU wake rate.
+    var preferredBufferFrames: UInt32 = 0
     private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
     private var processListenerBlock: AudioObjectPropertyListenerBlock?
 
@@ -197,6 +246,22 @@ final class AudioTapEngine {
                 "AudioHardwareCreateAggregateDevice"
             )
 
+            if preferredBufferFrames > 0 {
+                var frames = preferredBufferFrames
+                var address = AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyBufferFrameSize,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                try checkOSStatus(
+                    AudioObjectSetPropertyData(
+                        aggregateID, &address, 0, nil,
+                        UInt32(MemoryLayout<UInt32>.size), &frames
+                    ),
+                    "AudioObjectSetPropertyData(kAudioDevicePropertyBufferFrameSize, \(preferredBufferFrames))"
+                )
+            }
+
             let tapFormat = try tapStreamFormat(of: tapID)
             let bufferFrames = try bufferFrameSize(of: aggregateID)
 
@@ -205,6 +270,7 @@ final class AudioTapEngine {
             let stats = self.stats
             let probe = self.probe
             let kernelHolder = self.kernelHolder
+            let captureRing = self.captureRing
             try checkOSStatus(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, ioQueue) {
                     _, inInputData, _, outOutputData, _ in
@@ -216,6 +282,7 @@ final class AudioTapEngine {
                             applyKernel(kernel, output: outOutputData)
                         }
                     }
+                    captureOutput(outOutputData, into: captureRing)
                 },
                 "AudioDeviceCreateIOProcIDWithBlock"
             )
@@ -304,6 +371,19 @@ final class AudioTapEngine {
         }
         stop()
     }
+}
+
+/// Feeds the first output buffer (as heard, post-EQ) into the spectrum ring.
+private func captureOutput(_ output: UnsafeMutablePointer<AudioBufferList>, into ring: CaptureRing) {
+    let buffers = UnsafeMutableAudioBufferListPointer(output)
+    guard let first = buffers.first, let data = first.mData else { return }
+    let channels = Int(max(first.mNumberChannels, 1))
+    let sampleCount = Int(first.mDataByteSize) / MemoryLayout<Float>.size
+    ring.write(
+        interleaved: data.assumingMemoryBound(to: Float.self),
+        frameCount: sampleCount / channels,
+        channelCount: channels
+    )
 }
 
 /// Runs the EQ kernel in place on every output buffer. Real-time safe.

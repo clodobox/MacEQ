@@ -176,6 +176,7 @@ struct ResponseCurveView: View {
             ZStack {
                 Canvas { context, canvasSize in
                     drawGrid(context: context, size: canvasSize)
+                    drawSpectrum(context: context, size: canvasSize)
                     drawCurve(context: context, size: canvasSize)
                 }
                 ForEach(controller.parametricFilters.indices, id: \.self) { index in
@@ -200,6 +201,8 @@ struct ResponseCurveView: View {
         }
         .background(Color.primary.opacity(0.05))
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        .onAppear { controller.startSpectrum() }
+        .onDisappear { controller.stopSpectrum() }
     }
 
     // MARK: - Coordinate mapping
@@ -259,6 +262,28 @@ struct ResponseCurveView: View {
                 at: CGPoint(x: xPosition(frequency: frequency, width: size.width) + 10, y: size.height - 7)
             )
         }
+    }
+
+    /// Live output spectrum, drawn as a translucent filled skyline behind the
+    /// response curve. Spectrum dBFS (-80..0) maps onto the full plot height —
+    /// a different scale than the response dB axis, purely for visualization.
+    private func drawSpectrum(context: GraphicsContext, size: CGSize) {
+        let spectrum = controller.spectrumDB
+        guard spectrum.count == EQController.spectrumBands.count else { return }
+        let floorDB = -80.0
+        var path = Path()
+        path.move(to: CGPoint(x: 0, y: size.height))
+        for (index, band) in EQController.spectrumBands.enumerated() {
+            let fraction = max(0, min(1, (spectrum[index] - floorDB) / -floorDB))
+            let point = CGPoint(
+                x: xPosition(frequency: band, width: size.width),
+                y: size.height * CGFloat(1 - fraction)
+            )
+            path.addLine(to: point)
+        }
+        path.addLine(to: CGPoint(x: size.width, y: size.height))
+        path.closeSubpath()
+        context.fill(path, with: .color(.blue.opacity(0.15)))
     }
 
     private func drawCurve(context: GraphicsContext, size: CGSize) {

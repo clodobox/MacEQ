@@ -434,8 +434,42 @@ func testLimiterTransparentBelowThreshold() {
 testKernelAppliesBandGainToSine()
 testKernelLowBandsApplyGain()
 testKernelPreampScales()
+// MARK: - Spectrum analyzer
+
+func testSpectrumAnalyzerFindsSine() {
+    guard let analyzer = SpectrumAnalyzer(fftSize: 2048) else {
+        expect(false, "analyzer construction failed")
+        return
+    }
+    let sampleRate = 48000.0
+    var samples = [Float](repeating: 0, count: 4096)
+    for index in samples.indices {
+        samples[index] = Float(sin(2.0 * Double.pi * 1000.0 * Double(index) / sampleRate))
+    }
+    let bands = logSpacedFrequencies(from: 20, to: 20000, count: 48)
+    let spectrum = analyzer.bandMagnitudesDB(samples: samples, sampleRate: sampleRate, bandFrequencies: bands)
+    expect(spectrum.count == bands.count, "one magnitude per band")
+
+    guard let peakIndex = spectrum.indices.max(by: { spectrum[$0] < spectrum[$1] }) else {
+        expect(false, "no spectrum peak")
+        return
+    }
+    let peakBandLow = bands[peakIndex]
+    let peakBandHigh = peakIndex + 1 < bands.count ? bands[peakIndex + 1] : 24000
+    expect(
+        peakBandLow <= 1000 && 1000 <= peakBandHigh,
+        "peak band [\(peakBandLow), \(peakBandHigh)] should contain 1 kHz"
+    )
+    expectClose(spectrum[peakIndex], 0.0, tolerance: 1.0, "full-scale sine reads ~0 dBFS")
+
+    // Far away from the tone, the floor should be way down.
+    expect(spectrum[5] < -60, "low bands near noise floor, got \(spectrum[5])")
+    expect(spectrum[44] < -60, "high bands near noise floor, got \(spectrum[44])")
+}
+
 testLimiterCatchesOvers()
 testLimiterTransparentBelowThreshold()
+testSpectrumAnalyzerFindsSine()
 
 if failureCount > 0 {
     print("\(failureCount) of \(expectationCount) expectations FAILED")

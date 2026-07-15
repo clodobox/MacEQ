@@ -2,6 +2,7 @@ import AppKit
 import CoreAudio
 import Foundation
 import MacEQCore
+import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -84,6 +85,32 @@ final class EQController: ObservableObject {
     @Published private(set) var statusSummary = "Not running"
     @Published private(set) var diagnosticLines: [String] = []
     @Published private(set) var effectivePreampDB: Double = 0
+    @Published private(set) var spectrumDB: [Double] = []
+    @Published private(set) var cpuPercent: Double = 0
+    @Published var bufferFrames: Int {
+        didSet {
+            guard !isApplyingProfile else { return }
+            defaults.set(bufferFrames, forKey: "bufferFrames")
+            if isRunning {
+                stop()
+                start()
+            }
+        }
+    }
+    @Published var launchAtLogin: Bool {
+        didSet {
+            guard !isApplyingProfile else { return }
+            do {
+                if launchAtLogin {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                errorMessage = "Launch-at-login change failed: \(error)"
+            }
+        }
+    }
     @Published var excludedBundleIDs: Set<String> {
         didSet {
             guard !isApplyingProfile else { return }
@@ -123,6 +150,8 @@ final class EQController: ObservableObject {
         }
 
         excludedBundleIDs = Set(defaults.stringArray(forKey: "excludedBundleIDs") ?? [])
+        bufferFrames = defaults.object(forKey: "bufferFrames") as? Int ?? 0
+        launchAtLogin = SMAppService.mainApp.status == .enabled
 
         engine.onDefaultOutputDeviceChanged = { [weak self] in
             self?.handleDeviceChange()
@@ -194,6 +223,7 @@ final class EQController: ObservableObject {
             let excluded = resolveExcludedAudioProcesses()
             engine.excludedProcessObjects = excluded.objects
             lastExcludedPIDs = excluded.pids.sorted()
+            engine.preferredBufferFrames = UInt32(max(bufferFrames, 0))
             try engine.start()
             isRunning = true
             loadProfileForCurrentDevice()
@@ -421,6 +451,56 @@ final class EQController: ObservableObject {
         start()
     }
 
+    // MARK: - Spectrum display
+
+    static let spectrumBands = logSpacedFrequencies(from: 20, to: 20000, count: 48)
+    private let analyzer = SpectrumAnalyzer(fftSize: 2048)
+    private var spectrumTimer: Timer?
+
+    /// ~30 fps spectrum updates; runs only while a curve view is visible.
+    func startSpectrum() {
+        guard spectrumTimer == nil else { return }
+        spectrumTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard let analyzer = self.analyzer, self.isRunning else { return }
+                self.spectrumDB = analyzer.bandMagnitudesDB(
+                    samples: self.engine.captureRing.latest(analyzer.fftSize),
+                    sampleRate: self.currentSampleRate,
+                    bandFrequencies: Self.spectrumBands
+                )
+            }
+        }
+    }
+
+    func stopSpectrum() {
+        spectrumTimer?.invalidate()
+        spectrumTimer = nil
+        spectrumDB = []
+    }
+
+    // MARK: - CPU usage
+
+    private var lastCPUTime: Double = 0
+    private var lastCPUSample: Date?
+
+    /// Process CPU%: rusage user+system delta over wall-clock delta.
+    private func updateCPUUsage() {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return }
+        let seconds = Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+            + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        let now = Date()
+        if let lastSample = lastCPUSample {
+            let wall = now.timeIntervalSince(lastSample)
+            if wall > 0 {
+                cpuPercent = max((seconds - lastCPUTime) / wall * 100, 0)
+            }
+        }
+        lastCPUTime = seconds
+        lastCPUSample = now
+    }
+
     private func startPolling() {
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -432,17 +512,20 @@ final class EQController: ObservableObject {
 
     private func refreshStatus() {
         guard let status = engine.status else { return }
+        updateCPUUsage()
         let stats = engine.stats
         let peakDB: Double = stats.lastPeak > 0 ? Double(20 * log10(stats.lastPeak)) : -120
         statusSummary = String(
-            format: "%@ · %.0f kHz · peak %.1f dBFS",
+            format: "%@ · %.0f kHz · %.1f ms · CPU %.1f%%",
             status.outputDeviceName,
             status.sampleRate / 1000,
-            peakDB
+            Double(status.bufferFrameSize) / status.sampleRate * 1000,
+            cpuPercent
         )
         diagnosticLines = [
             "Tap format: \(status.tapFormatDescription)",
             String(format: "IO buffer: %u frames (~%.1f ms)", status.bufferFrameSize, Double(status.bufferFrameSize) / status.sampleRate * 1000),
+            String(format: "Peak: %.1f dBFS", peakDB),
             "Callbacks: \(stats.callbackCount), silent streak: \(stats.consecutiveZeroBuffers)",
         ] + engine.diagnostics()
         writeStatusSnapshot()

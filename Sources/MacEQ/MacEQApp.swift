@@ -78,6 +78,14 @@ struct EQPopoverView: View {
             Menu {
                 Button("Reset All Bands") { controller.resetAllBands() }
                 Toggle("Safety Limiter", isOn: $controller.limiterEnabled)
+                Toggle("Launch at Login", isOn: $controller.launchAtLogin)
+                Picker("Buffer Size", selection: $controller.bufferFrames) {
+                    Text("Device Default").tag(0)
+                    Text("128 frames (lowest latency)").tag(128)
+                    Text("256 frames").tag(256)
+                    Text("512 frames").tag(512)
+                    Text("1024 frames (safest)").tag(1024)
+                }
                 Button("Excluded Apps…") {
                     openWindow(id: "excluded-apps")
                     NSApplication.shared.activate(ignoringOtherApps: true)

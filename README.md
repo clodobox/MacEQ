@@ -46,8 +46,14 @@ play music in any app.
 
 ## Roadmap
 
-- **M1:** menu-bar app, 10-band graphic EQ (`vDSP.Biquad`), preamp, bypass,
-  output-device follow.
-- **M2:** parametric EQ with draggable curve, Equalizer APO `config.txt` presets,
-  AutoEQ import, per-device profiles, exclude list, limiter.
-- **M3:** spectrum analyzer, convolution/FIR, buffer-size control, hotkeys.
+- **M0 (done):** muted-tap + private-aggregate passthrough spike.
+- **M1 (done):** menu-bar app, 10-band graphic EQ (vDSP biquads), preamp with
+  auto mode, bypass, output-device follow.
+- **M2 (done):** parametric EQ (12 APO filter types, draggable response curve,
+  band table), Equalizer APO `config.txt` as the native preset format, AutoEQ
+  import (paste + file), per-device profiles, app exclude list, safety limiter.
+- **M3 (in progress):** spectrum analyzer overlay (done), latency/CPU display
+  (done), buffer-size control (done), launch-at-login (done); remaining:
+  convolution/FIR room correction, global hotkeys.
+- **Hardening (planned):** zero-buffer tap watchdog, multi-output attenuation
+  compensation, soak tests; Developer ID signing + notarization for distribution.
