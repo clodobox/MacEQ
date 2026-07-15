@@ -56,6 +56,18 @@ final class EngineStatusModel: ObservableObject {
     @Published var diagnosticLines: [String] = []
 }
 
+/// A user-named EQ snapshot, applied on demand from the presets menu. Captures
+/// the tuning (bands, mode, parametric chain, preamp) but not device-level state
+/// like the bypass switch or the impulse response.
+struct NamedPreset: Codable {
+    var name: String
+    var gains: [Double]
+    var mode: String
+    var parametricConfig: String
+    var manualPreampDB: Double
+    var autoPreampEnabled: Bool
+}
+
 /// UI-facing state for the 10-band graphic EQ. Owns the audio engine, rebuilds
 /// the DSP kernel on every change, persists settings, and mirrors status for
 /// debugging. Main-actor: all mutations come from the UI or main-queue callbacks.
@@ -110,6 +122,7 @@ final class EQController: ObservableObject {
     }
     /// Display name of the loaded impulse response file, nil when none is set.
     @Published private(set) var impulseResponseName: String?
+    @Published private(set) var namedPresets: [NamedPreset] = []
 
     @Published private(set) var isRunning = false
     @Published private(set) var errorMessage: String?
@@ -189,6 +202,10 @@ final class EQController: ObservableObject {
         if let path = defaults.string(forKey: "impulseResponsePath") {
             impulseResponseURL = URL(fileURLWithPath: path)
             impulseResponseName = (path as NSString).lastPathComponent
+        }
+        if let data = defaults.data(forKey: "namedPresets"),
+           let presets = try? JSONDecoder().decode([NamedPreset].self, from: data) {
+            namedPresets = presets
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
@@ -444,6 +461,57 @@ final class EQController: ObservableObject {
             try currentConfigText().write(to: url, atomically: true, encoding: .utf8)
         } catch {
             errorMessage = "Could not write \(url.lastPathComponent): \(error)"
+        }
+    }
+
+    // MARK: - Named presets
+
+    /// Saves the current tuning under a name, replacing an existing preset with
+    /// the same (trimmed) name.
+    func saveCurrentAsPreset(named name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let preset = NamedPreset(
+            name: trimmed,
+            gains: gains,
+            mode: mode.rawValue,
+            parametricConfig: serializeAPOConfig(
+                EQPreset(preampDB: manualPreampDB, filters: parametricFilters)
+            ),
+            manualPreampDB: manualPreampDB,
+            autoPreampEnabled: autoPreampEnabled
+        )
+        namedPresets.removeAll { $0.name == trimmed }
+        namedPresets.append(preset)
+        persistNamedPresets()
+    }
+
+    /// Applies a named preset to the current device (one rebuild, not one per field).
+    func applyPreset(_ preset: NamedPreset) {
+        isApplyingProfile = true
+        if preset.gains.count == Self.bands.count {
+            gains = preset.gains
+        }
+        mode = EQMode(rawValue: preset.mode) ?? mode
+        manualPreampDB = preset.manualPreampDB
+        autoPreampEnabled = preset.autoPreampEnabled
+        if let parsed = try? parseAPOConfig(preset.parametricConfig) {
+            parametricFilters = parsed.filters
+        }
+        isApplyingProfile = false
+        settingsChanged()
+    }
+
+    func deletePreset(named name: String) {
+        namedPresets.removeAll { $0.name == name }
+        persistNamedPresets()
+    }
+
+    private func persistNamedPresets() {
+        do {
+            defaults.set(try JSONEncoder().encode(namedPresets), forKey: "namedPresets")
+        } catch {
+            errorMessage = "Failed to encode presets: \(error)"
         }
     }
 

@@ -31,6 +31,11 @@ struct MacEQApp: App {
             HotkeyRecorderView(controller: AppDelegate.controller)
         }
         .windowResizability(.contentSize)
+
+        Window("Save Preset", id: "save-preset") {
+            PresetNameView(controller: AppDelegate.controller)
+        }
+        .windowResizability(.contentSize)
     }
 }
 
@@ -119,6 +124,28 @@ struct EQPopoverView: View {
                     Button("Load Impulse Response…") { controller.chooseImpulseResponse() }
                 }
                 Divider()
+                Menu("Presets") {
+                    ForEach(controller.namedPresets, id: \.name) { preset in
+                        Button(preset.name) { controller.applyPreset(preset) }
+                    }
+                    if controller.namedPresets.isEmpty {
+                        Text("No saved presets")
+                    }
+                    Divider()
+                    Button("Save Current as Preset…") {
+                        openWindow(id: "save-preset")
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                    }
+                    if !controller.namedPresets.isEmpty {
+                        Menu("Delete Preset") {
+                            ForEach(controller.namedPresets, id: \.name) { preset in
+                                Button(preset.name, role: .destructive) {
+                                    controller.deletePreset(named: preset.name)
+                                }
+                            }
+                        }
+                    }
+                }
                 Button("Import Preset…") { controller.importPresetFromFile() }
                 Button("Export Preset…") { controller.exportPresetToFile() }
                 Divider()

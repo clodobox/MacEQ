@@ -10,15 +10,21 @@ set -euo pipefail
 
 CONFIGURATION="${1:-release}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="$PROJECT_DIR/.build/$CONFIGURATION"
 APP_DIR="$PROJECT_DIR/build/MacEQ.app"
 
 cd "$PROJECT_DIR"
-swift build -c "$CONFIGURATION"
+# Universal (Apple Silicon + Intel) binary. `swift build --arch a --arch b`
+# needs full Xcode's xcbuild; with Command Line Tools only, build each slice
+# via its triple and merge with lipo.
+swift build -c "$CONFIGURATION" --triple arm64-apple-macosx
+swift build -c "$CONFIGURATION" --triple x86_64-apple-macosx
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
-cp "$BUILD_DIR/MacEQ" "$APP_DIR/Contents/MacOS/MacEQ"
+lipo -create \
+    "$PROJECT_DIR/.build/arm64-apple-macosx/$CONFIGURATION/MacEQ" \
+    "$PROJECT_DIR/.build/x86_64-apple-macosx/$CONFIGURATION/MacEQ" \
+    -output "$APP_DIR/Contents/MacOS/MacEQ"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
 codesign --force --sign - "$APP_DIR"
