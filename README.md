@@ -30,10 +30,15 @@ app covers both).
    [latest release](https://github.com/jatinindia/MacEQ/releases/latest) and
    unzip it.
 2. Drag `MacEQ.app` to your Applications folder.
-3. **Right-click the app and choose Open**, then confirm. (Double-clicking the
-   first time will be blocked — see [Why does macOS warn me?](#why-does-macos-warn-me)
-   below.) On macOS 15 you may instead need to go to
-   System Settings → Privacy & Security → **Open Anyway**.
+3. The first launch is blocked, because MacEQ isn't signed with a paid Apple
+   certificate. This is expected — see
+   [Why does macOS block it?](#why-does-macos-block-it) below. To get past it,
+   **once**:
+   - **macOS 15 and later:** double-click MacEQ and accept the warning. Then open
+     System Settings → Privacy & Security, scroll down to the "MacEQ was blocked"
+     line, and click **Open Anyway**. (The old right-click → Open trick no longer
+     works — Apple removed it in macOS 15.)
+   - **macOS 14:** right-click the app, choose **Open**, then confirm.
 4. macOS asks for permission to record system audio. Say yes — this is the
    permission that lets MacEQ hear the audio it needs to equalize. It is
    required for the app to do anything at all.
@@ -156,12 +161,15 @@ released `.zip` carries no signature proving it came from this repository. If yo
 want certainty, build it from source yourself — it's two commands, below. Signing
 and notarizing properly needs a paid Apple Developer account and is on the list.
 
-### Why does macOS warn me?
+### Why does macOS block it?
 
 Because of that missing paid signature, not because anything is wrong with the
-app. Right-click → Open (or Privacy & Security → Open Anyway) tells macOS you
-trust it. Do that only because you trust the source — that advice applies to
-every unsigned app you download, not just this one.
+app. Anything you download from the web gets a quarantine flag, and macOS
+refuses to open quarantined apps it can't attribute to a known developer.
+Approving it once in Privacy & Security clears that for good.
+
+Do that because you trust the source, not because a README told you to — the
+same caution applies to every unsigned app you download, this one included.
 
 ## Updating
 
@@ -173,6 +181,7 @@ and replace the app in Applications. Your settings and presets are kept.
 
 | Symptom | Fix |
 | --- | --- |
+| macOS won't open it at all, even via Open Anyway | Strip the download flag: `xattr -dr com.apple.quarantine /Applications/MacEQ.app`, then open it. |
 | No sound at all | ⋯ → **Stop Audio Engine**, then **Start Audio Engine**. |
 | No permission prompt appeared | System Settings → Privacy & Security → check MacEQ under audio recording. |
 | Permission prompt returns after every rebuild | Expected with ad-hoc signing. Reset with `tccutil reset SystemAudioCaptureRequests com.jatingrewal.maceq`. |
