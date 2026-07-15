@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreAudio
 import Foundation
 import MacEQCore
@@ -44,6 +45,15 @@ struct DeviceProfile: Codable {
 @MainActor
 final class SpectrumModel: ObservableObject {
     @Published var levelsDB: [Double] = []
+}
+
+/// Status/diagnostics text refreshed twice a second, isolated from EQController
+/// for the same reason as SpectrumModel: only the footer should re-render on
+/// the poll tick, not the whole popover (sliders, menu, curve).
+@MainActor
+final class EngineStatusModel: ObservableObject {
+    @Published var summary = "Not running"
+    @Published var diagnosticLines: [String] = []
 }
 
 /// UI-facing state for the 10-band graphic EQ. Owns the audio engine, rebuilds
@@ -103,11 +113,10 @@ final class EQController: ObservableObject {
 
     @Published private(set) var isRunning = false
     @Published private(set) var errorMessage: String?
-    @Published private(set) var statusSummary = "Not running"
-    @Published private(set) var diagnosticLines: [String] = []
     @Published private(set) var effectivePreampDB: Double = 0
     let spectrum = SpectrumModel()
-    @Published private(set) var cpuPercent: Double = 0
+    let statusModel = EngineStatusModel()
+    private var cpuPercent: Double = 0
     @Published var bufferFrames: Int {
         didSet {
             guard !isApplyingProfile else { return }
@@ -279,8 +288,8 @@ final class EQController: ObservableObject {
         engine.convolverHolder.convolver = nil
         engine.stop()
         isRunning = false
-        statusSummary = "Not running"
-        diagnosticLines = []
+        statusModel.summary = "Not running"
+        statusModel.diagnosticLines = []
     }
 
     func resetAllBands() {
@@ -562,6 +571,39 @@ final class EQController: ObservableObject {
         start()
     }
 
+    // MARK: - Global hotkey
+
+    /// Human-readable current binding (e.g. "⌥⌘E"), for menus and tooltips.
+    @Published private(set) var hotkeyDisplay: String = "⌥⌘E"
+    private var hotkeyManager: HotkeyManager?
+
+    /// Registers the persisted (or default ⌥⌘E) global EQ-bypass hotkey.
+    func registerHotkey() {
+        hotkeyDisplay = defaults.string(forKey: "hotkeyDisplay") ?? "⌥⌘E"
+        let keyCode = UInt32(defaults.object(forKey: "hotkeyKeyCode") as? Int ?? kVK_ANSI_E)
+        let modifiers = UInt32(
+            defaults.object(forKey: "hotkeyModifiers") as? Int ?? (optionKey | cmdKey)
+        )
+        // Release the old registration first so re-binding the same combo works.
+        hotkeyManager = nil
+        hotkeyManager = HotkeyManager(keyCode: keyCode, modifiers: modifiers) { [weak self] in
+            DispatchQueue.main.async {
+                self?.eqEnabled.toggle()
+            }
+        }
+        if hotkeyManager == nil {
+            errorMessage = "Could not register global hotkey \(hotkeyDisplay) — another app may already use it."
+        }
+    }
+
+    /// Persists and activates a new hotkey binding (from the recorder window).
+    func setHotkey(keyCode: UInt32, modifiers: UInt32, display: String) {
+        defaults.set(Int(keyCode), forKey: "hotkeyKeyCode")
+        defaults.set(Int(modifiers), forKey: "hotkeyModifiers")
+        defaults.set(display, forKey: "hotkeyDisplay")
+        registerHotkey()
+    }
+
     // MARK: - Zero-buffer watchdog
 
     /// The documented process-tap platform bug: after long uptime the tap starts
@@ -609,6 +651,7 @@ final class EQController: ObservableObject {
     /// ~20 fps spectrum updates; runs only while a curve view is visible.
     func startSpectrum() {
         guard spectrumTimer == nil else { return }
+        engine.captureRing.captureEnabled = true
         spectrumTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
@@ -623,6 +666,7 @@ final class EQController: ObservableObject {
     }
 
     func stopSpectrum() {
+        engine.captureRing.captureEnabled = false
         spectrumTimer?.invalidate()
         spectrumTimer = nil
         spectrum.levelsDB = []
@@ -664,7 +708,7 @@ final class EQController: ObservableObject {
         updateCPUUsage()
         let stats = engine.stats
         let peakDB: Double = stats.lastPeak > 0 ? Double(20 * log10(stats.lastPeak)) : -120
-        statusSummary = String(
+        statusModel.summary = String(
             format: "%@ · %.0f kHz · %.1f ms · CPU %.1f%%",
             status.outputDeviceName,
             status.sampleRate / 1000,
@@ -685,7 +729,7 @@ final class EQController: ObservableObject {
                 20 * log10(Double(status.tapCompensationGain))
             ))
         }
-        diagnosticLines = lines + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
+        statusModel.diagnosticLines = lines + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
         writeStatusSnapshot()
         checkZeroBufferWatchdog(status: status, stats: stats)
     }
@@ -712,9 +756,9 @@ final class EQController: ObservableObject {
         gains: \(gains)
         preamp: \(effectivePreampDB) (auto: \(autoPreampEnabled))
         error: \(errorMessage ?? "none")
-        status: \(statusSummary)
+        status: \(statusModel.summary)
         watchdog: \(watchdogRestartCount) restarts\(lastWatchdogRestart.map { ", last \($0)" } ?? "")
-        \(diagnosticLines.joined(separator: "\n"))
+        \(statusModel.diagnosticLines.joined(separator: "\n"))
         """
         try? (snapshot + "\nexcluded: \(excludedBundleIDs.sorted())")
             .write(toFile: "/tmp/maceq-spike-status.txt", atomically: true, encoding: .utf8)

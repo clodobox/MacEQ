@@ -1,9 +1,9 @@
 import Carbon.HIToolbox
 import Foundation
 
-/// Registers the global EQ-bypass hotkey (Option+Command+E) via Carbon's
-/// RegisterEventHotKey — the only global-hotkey API that works without the
-/// Accessibility permission. Interfaces a C API, hence a class.
+/// Registers the global EQ-bypass hotkey via Carbon's RegisterEventHotKey — the
+/// only global-hotkey API that works without the Accessibility permission.
+/// Interfaces a C API, hence a class.
 ///
 /// The Carbon event handler fires on the main thread (application event target),
 /// so `onToggle` is invoked on the main thread.
@@ -12,7 +12,9 @@ final class HotkeyManager {
     private var eventHandler: EventHandlerRef?
     private let onToggle: () -> Void
 
-    init?(onToggle: @escaping () -> Void) {
+    /// keyCode is a Carbon virtual key (kVK_*); modifiers is a Carbon modifier
+    /// mask (cmdKey/optionKey/controlKey/shiftKey).
+    init?(keyCode: UInt32, modifiers: UInt32, onToggle: @escaping () -> Void) {
         self.onToggle = onToggle
 
         var eventType = EventTypeSpec(
@@ -38,15 +40,15 @@ final class HotkeyManager {
 
         let hotKeyID = EventHotKeyID(signature: OSType(0x4D45_5131) /* 'MEQ1' */, id: 1)
         let registerStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_E),
-            UInt32(optionKey | cmdKey),
+            keyCode,
+            modifiers,
             hotKeyID,
             GetApplicationEventTarget(),
             0,
             &hotKeyRef
         )
         guard registerStatus == noErr else {
-            // Most likely another app owns Option+Command+E; the app works
+            // Most likely another app owns this combination; the app works
             // without the hotkey, so this is non-fatal.
             print("warning: hotkey registration failed with OSStatus \(registerStatus)")
             RemoveEventHandler(eventHandler)

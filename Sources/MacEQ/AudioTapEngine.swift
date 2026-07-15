@@ -23,6 +23,10 @@ final class ConvolverHolder {
 /// harmless for visualization, so no synchronization is used.
 final class CaptureRing {
     static let capacity = 8192  // power of two
+    /// UI writes, audio thread reads (word-sized store, same rationale as
+    /// IOStats): capture costs a per-sample loop, so it runs only while a
+    /// spectrum view is actually visible.
+    var captureEnabled = false
     private let samples = UnsafeMutablePointer<Float>.allocate(capacity: CaptureRing.capacity)
     private var writeIndex = 0
 
@@ -274,7 +278,9 @@ final class AudioTapEngine {
                     if let kernel = kernelHolder.kernel {
                         applyKernel(kernel, output: outOutputData)
                     }
-                    captureOutput(outOutputData, into: captureRing)
+                    if captureRing.captureEnabled {
+                        captureOutput(outOutputData, into: captureRing)
+                    }
                 },
                 "AudioDeviceCreateIOProcIDWithBlock"
             )
@@ -480,11 +486,12 @@ private func passthrough(
 
         let samples = inData.assumingMemoryBound(to: Float.self)
         let count = byteCount / MemoryLayout<Float>.size
-        for i in 0..<count {
-            let value = abs(samples[i])
-            if value > peak { peak = value }
-            sumOfSquares += value * value
-        }
+        var bufferPeak: Float = 0
+        vDSP_maxmgv(samples, 1, &bufferPeak, vDSP_Length(count))
+        if bufferPeak > peak { peak = bufferPeak }
+        var bufferSumOfSquares: Float = 0
+        vDSP_svesq(samples, 1, &bufferSumOfSquares, vDSP_Length(count))
+        sumOfSquares += bufferSumOfSquares
         sampleCount += count
         let channels = max(inBuffer.mNumberChannels, 1)
         framesThisCallback += UInt64(count) / UInt64(channels)

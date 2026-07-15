@@ -5,17 +5,10 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let controller = EQController()
-    private var hotkeyManager: HotkeyManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.controller.start()
-        // Carbon delivers the hotkey on the main thread; hop into the actor
-        // explicitly since the C callback carries no isolation.
-        hotkeyManager = HotkeyManager {
-            DispatchQueue.main.async {
-                AppDelegate.controller.eqEnabled.toggle()
-            }
-        }
+        Self.controller.registerHotkey()
     }
 }
 
@@ -31,6 +24,11 @@ struct MacEQApp: App {
 
         Window("Excluded Apps", id: "excluded-apps") {
             ExcludedAppsView(controller: AppDelegate.controller)
+        }
+        .windowResizability(.contentSize)
+
+        Window("MacEQ Hotkey", id: "hotkey-recorder") {
+            HotkeyRecorderView(controller: AppDelegate.controller)
         }
         .windowResizability(.contentSize)
     }
@@ -49,13 +47,23 @@ struct EQPopoverView: View {
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
-            Picker("", selection: $controller.mode) {
-                Text("Graphic").tag(EQMode.graphic)
-                Text("Parametric").tag(EQMode.parametric)
+            HStack(spacing: 8) {
+                Picker("", selection: $controller.mode) {
+                    Text("Graphic").tag(EQMode.graphic)
+                    Text("Parametric").tag(EQMode.parametric)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                if controller.mode == .graphic {
+                    Spacer()
+                    Button("Reset") {
+                        controller.resetAllBands()
+                    }
+                    .controlSize(.small)
+                    .help("Reset all bands to 0 dB (this device's profile only)")
+                }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
 
             Group {
                 if controller.mode == .graphic {
@@ -82,11 +90,15 @@ struct EQPopoverView: View {
             Toggle("", isOn: $controller.eqEnabled)
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .help("Enable or bypass the equalizer (⌥⌘E anywhere)")
+                .help("Enable or bypass the equalizer (\(controller.hotkeyDisplay) anywhere)")
             Menu {
                 Button("Reset All Bands") { controller.resetAllBands() }
                 Toggle("Safety Limiter", isOn: $controller.limiterEnabled)
                 Toggle("Launch at Login", isOn: $controller.launchAtLogin)
+                Button("Change Hotkey… (\(controller.hotkeyDisplay))") {
+                    openWindow(id: "hotkey-recorder")
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
                 Picker("Buffer Size", selection: $controller.bufferFrames) {
                     Text("Device Default").tag(0)
                     Text("128 frames (lowest latency)").tag(128)
@@ -182,19 +194,35 @@ struct EQPopoverView: View {
     }
 
     private var footer: some View {
+        StatusFooterView(isRunning: controller.isRunning, statusModel: controller.statusModel)
+    }
+
+    private func gainLabel(_ gain: Double) -> String {
+        gain == 0 ? "0" : String(format: "%+.0f", gain)
+    }
+}
+
+/// Status line + diagnostics. A separate view on purpose: it alone observes
+/// EngineStatusModel, so the twice-a-second poll updates redraw only this
+/// footer instead of the whole popover.
+struct StatusFooterView: View {
+    let isRunning: Bool
+    @ObservedObject var statusModel: EngineStatusModel
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(controller.isRunning ? Color.green : Color.red)
+                    .fill(isRunning ? Color.green : Color.red)
                     .frame(width: 7, height: 7)
-                Text(controller.statusSummary)
+                Text(statusModel.summary)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             DisclosureGroup {
                 VStack(alignment: .leading, spacing: 2) {
-                    ForEach(controller.diagnosticLines, id: \.self) { line in
+                    ForEach(statusModel.diagnosticLines, id: \.self) { line in
                         Text(line)
                             .font(.system(size: 9, design: .monospaced))
                             .foregroundStyle(.tertiary)
@@ -207,10 +235,6 @@ struct EQPopoverView: View {
                     .foregroundStyle(.tertiary)
             }
         }
-    }
-
-    private func gainLabel(_ gain: Double) -> String {
-        gain == 0 ? "0" : String(format: "%+.0f", gain)
     }
 }
 
