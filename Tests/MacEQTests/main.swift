@@ -147,7 +147,7 @@ func testKernelAppliesBandGainToSine() {
     let frameCount = 48000
     let frequency = 1000.0
     let cascade = [peakingCoefficients(sampleRate: sampleRate, frequency: frequency, q: 1.0, gainDB: 6.0)]
-    guard let kernel = EQKernel(cascade: cascade, preampDB: 0, sampleRate: sampleRate, maxChannels: 2) else {
+    guard let kernel = EQKernel(cascade: cascade, preampDB: 0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: false) else {
         expect(false, "kernel construction failed")
         return
     }
@@ -179,7 +179,7 @@ func testKernelLowBandsApplyGain() {
     let skip = 48000
     for (frequency, q) in [(31.5, 2.2), (63.0, 2.2), (125.0, 2.2)] {
         let cascade = [peakingCoefficients(sampleRate: sampleRate, frequency: frequency, q: q, gainDB: 12.0)]
-        guard let kernel = EQKernel(cascade: cascade, preampDB: 0, sampleRate: sampleRate, maxChannels: 2) else {
+        guard let kernel = EQKernel(cascade: cascade, preampDB: 0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: false) else {
             expect(false, "kernel construction failed for \(frequency) Hz")
             continue
         }
@@ -202,7 +202,7 @@ func testKernelLowBandsApplyGain() {
 func testKernelPreampScales() {
     let sampleRate = 48000.0
     let cascade = [peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 1.0, gainDB: 0.0)]
-    guard let kernel = EQKernel(cascade: cascade, preampDB: -6.0, sampleRate: sampleRate, maxChannels: 2) else {
+    guard let kernel = EQKernel(cascade: cascade, preampDB: -6.0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: false) else {
         expect(false, "kernel construction failed")
         return
     }
@@ -370,9 +370,72 @@ testAPORoundTrip()
 testMagnitudeResponse()
 testAutoPreamp()
 testLogSpacedFrequencies()
+// MARK: - Limiter
+
+func testLimiterCatchesOvers() {
+    let sampleRate = 48000.0
+    let frameCount = 48000
+    let cascade = [peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 1.0, gainDB: 0.0)]
+    // +12 dB preamp on a 0.5-amplitude sine would peak at ~2.0 without a limiter.
+    guard let kernel = EQKernel(
+        cascade: cascade, preampDB: 12.0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: true
+    ) else {
+        expect(false, "kernel construction failed")
+        return
+    }
+    var buffer = [Float](repeating: 0, count: frameCount * 2)
+    for frame in 0..<frameCount {
+        let value = Float(sin(2.0 * Double.pi * 200.0 * Double(frame) / sampleRate)) * 0.5
+        buffer[frame * 2] = value
+        buffer[frame * 2 + 1] = value
+    }
+    buffer.withUnsafeMutableBufferPointer { pointer in
+        kernel.process(interleaved: pointer.baseAddress!, frameCount: frameCount, channelCount: 2)
+    }
+    let maxSample = buffer.map { abs($0) }.max() ?? 0
+    expect(maxSample <= 1.0, "limiter keeps output at or below full scale, got \(maxSample)")
+    expect(maxSample > 0.9, "limiter should run near the ceiling, not crush the signal, got \(maxSample)")
+
+    // Stereo linkage: both channels must receive identical gain reduction.
+    var maxChannelDelta: Float = 0
+    for frame in 0..<frameCount {
+        maxChannelDelta = max(maxChannelDelta, abs(buffer[frame * 2] - buffer[frame * 2 + 1]))
+    }
+    expectClose(Double(maxChannelDelta), 0.0, tolerance: 1e-6, "stereo-linked limiter keeps channels identical")
+}
+
+func testLimiterTransparentBelowThreshold() {
+    let sampleRate = 48000.0
+    let frameCount = 48000
+    let cascade = [peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 1.0, gainDB: 0.0)]
+    guard let kernel = EQKernel(
+        cascade: cascade, preampDB: 0.0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: true
+    ) else {
+        expect(false, "kernel construction failed")
+        return
+    }
+    var buffer = [Float](repeating: 0, count: frameCount * 2)
+    for frame in 0..<frameCount {
+        let value = Float(sin(2.0 * Double.pi * 200.0 * Double(frame) / sampleRate)) * 0.1
+        buffer[frame * 2] = value
+        buffer[frame * 2 + 1] = value
+    }
+    let inputRMS = channelRMS(buffer, channel: 0, channelCount: 2, skipFrames: 4800)
+    buffer.withUnsafeMutableBufferPointer { pointer in
+        kernel.process(interleaved: pointer.baseAddress!, frameCount: frameCount, channelCount: 2)
+    }
+    let outputRMS = channelRMS(buffer, channel: 0, channelCount: 2, skipFrames: 4800)
+    expectClose(
+        20 * log10(outputRMS / inputRMS), 0.0, tolerance: 0.05,
+        "limiter is transparent for quiet signals"
+    )
+}
+
 testKernelAppliesBandGainToSine()
 testKernelLowBandsApplyGain()
 testKernelPreampScales()
+testLimiterCatchesOvers()
+testLimiterTransparentBelowThreshold()
 
 if failureCount > 0 {
     print("\(failureCount) of \(expectationCount) expectations FAILED")

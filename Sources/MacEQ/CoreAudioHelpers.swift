@@ -174,6 +174,46 @@ func deviceIsRunning(_ deviceID: AudioObjectID) throws -> Bool {
     return running != 0
 }
 
+/// All Core Audio process objects (processes that are audio clients right now).
+func audioProcessObjectIDs() throws -> [AudioObjectID] {
+    var address = propertyAddress(kAudioHardwarePropertyProcessObjectList)
+    var size: UInt32 = 0
+    try checkOSStatus(
+        AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size),
+        "AudioObjectGetPropertyDataSize(kAudioHardwarePropertyProcessObjectList)"
+    )
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    guard count > 0 else { return [] }
+    var ids = [AudioObjectID](repeating: AudioObjectID(kAudioObjectUnknown), count: count)
+    try checkOSStatus(
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids),
+        "AudioObjectGetPropertyData(kAudioHardwarePropertyProcessObjectList)"
+    )
+    return ids
+}
+
+/// The Unix PID behind a Core Audio process object.
+func pid(ofAudioProcess objectID: AudioObjectID) throws -> pid_t {
+    var address = propertyAddress(kAudioProcessPropertyPID)
+    var processPID: pid_t = -1
+    var size = UInt32(MemoryLayout<pid_t>.size)
+    try checkOSStatus(
+        AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &processPID),
+        "AudioObjectGetPropertyData(kAudioProcessPropertyPID, object \(objectID))"
+    )
+    return processPID
+}
+
+/// The bundle ID Core Audio records for an audio process (works for helper
+/// processes that NSRunningApplication cannot see).
+func bundleID(ofAudioProcess objectID: AudioObjectID) throws -> String {
+    try stringProperty(
+        of: objectID,
+        selector: kAudioProcessPropertyBundleID,
+        call: "AudioObjectGetPropertyData(kAudioProcessPropertyBundleID, object \(objectID))"
+    )
+}
+
 /// The stream format the tap delivers (sample rate, channels, interleaving).
 func tapStreamFormat(of tapID: AudioObjectID) throws -> AudioStreamBasicDescription {
     var address = propertyAddress(kAudioTapPropertyFormat)

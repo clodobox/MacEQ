@@ -20,11 +20,17 @@ struct MacEQApp: App {
             EQPopoverView(controller: AppDelegate.controller)
         }
         .menuBarExtraStyle(.window)
+
+        Window("Excluded Apps", id: "excluded-apps") {
+            ExcludedAppsView(controller: AppDelegate.controller)
+        }
+        .windowResizability(.contentSize)
     }
 }
 
 struct EQPopoverView: View {
     @ObservedObject var controller: EQController
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -71,6 +77,11 @@ struct EQPopoverView: View {
                 .help("Enable or bypass the equalizer")
             Menu {
                 Button("Reset All Bands") { controller.resetAllBands() }
+                Toggle("Safety Limiter", isOn: $controller.limiterEnabled)
+                Button("Excluded Apps…") {
+                    openWindow(id: "excluded-apps")
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
                 Divider()
                 if controller.isRunning {
                     Button("Stop Audio Engine") { controller.stop() }

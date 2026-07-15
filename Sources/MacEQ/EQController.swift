@@ -1,6 +1,14 @@
+import AppKit
+import CoreAudio
 import Foundation
 import MacEQCore
 import SwiftUI
+
+/// libsystem SPI: the PID of the app responsible for another PID (how Activity
+/// Monitor groups helper processes under their app). Required to match browser
+/// audio helpers against user-excluded apps; safe for Developer ID distribution.
+@_silgen_name("responsibility_get_pid_responsible_for_pid")
+private func responsibility_get_pid_responsible_for_pid(_ pid: pid_t) -> pid_t
 
 /// One graphic-EQ band: display label and peaking-filter center frequency.
 struct EQBand {
@@ -12,6 +20,17 @@ struct EQBand {
 enum EQMode: String {
     case graphic
     case parametric
+}
+
+/// Everything a device remembers, keyed by its Core Audio UID.
+/// The parametric chain is stored as APO config text (the native format).
+struct DeviceProfile: Codable {
+    var gains: [Double]
+    var mode: String
+    var parametricConfig: String
+    var manualPreampDB: Double
+    var autoPreampEnabled: Bool
+    var eqEnabled: Bool
 }
 
 /// UI-facing state for the 10-band graphic EQ. Owns the audio engine, rebuilds
@@ -50,6 +69,9 @@ final class EQController: ObservableObject {
     @Published var mode: EQMode {
         didSet { settingsChanged() }
     }
+    @Published var limiterEnabled: Bool {
+        didSet { settingsChanged() }
+    }
     @Published var parametricFilters: [FilterSpec] {
         didSet { settingsChanged() }
     }
@@ -61,6 +83,13 @@ final class EQController: ObservableObject {
     @Published private(set) var statusSummary = "Not running"
     @Published private(set) var diagnosticLines: [String] = []
     @Published private(set) var effectivePreampDB: Double = 0
+    @Published var excludedBundleIDs: Set<String> {
+        didSet {
+            guard !isApplyingProfile else { return }
+            defaults.set(Array(excludedBundleIDs).sorted(), forKey: "excludedBundleIDs")
+            restartForExclusionChange()
+        }
+    }
 
     private let engine = AudioTapEngine()
     /// Keeps recently replaced kernels alive so the audio thread's reference
@@ -69,6 +98,10 @@ final class EQController: ObservableObject {
     private var retiredKernels: [EQKernel] = []
     private var pollTimer: Timer?
     private let defaults = UserDefaults.standard
+    /// Suppresses persistence/kernel rebuilds while a device profile is being applied.
+    private var isApplyingProfile = false
+    /// UID of the device whose profile is currently loaded into the published state.
+    private var activeProfileUID: String?
 
     init() {
         let storedGains = defaults.array(forKey: "bandGains") as? [Double]
@@ -79,6 +112,7 @@ final class EQController: ObservableObject {
         autoPreampEnabled = defaults.object(forKey: "autoPreampEnabled") as? Bool ?? true
         eqEnabled = defaults.object(forKey: "eqEnabled") as? Bool ?? true
         mode = EQMode(rawValue: defaults.string(forKey: "eqMode") ?? "") ?? .graphic
+        limiterEnabled = defaults.object(forKey: "limiterEnabled") as? Bool ?? true
         // Parametric state persists in the native APO config.txt format.
         if let storedConfig = defaults.string(forKey: "parametricConfig"),
            let preset = try? parseAPOConfig(storedConfig) {
@@ -87,22 +121,88 @@ final class EQController: ObservableObject {
             parametricFilters = []
         }
 
+        excludedBundleIDs = Set(defaults.stringArray(forKey: "excludedBundleIDs") ?? [])
+
         engine.onDefaultOutputDeviceChanged = { [weak self] in
             self?.handleDeviceChange()
         }
+        engine.onProcessListChanged = { [weak self] in
+            self?.scheduleExclusionRecheck()
+        }
+    }
+
+    // MARK: - Exclude list
+
+    /// Core Audio process objects whose *responsible app* is excluded.
+    ///
+    /// Browser/Electron audio comes from helper processes (WebKit GPU, Chrome
+    /// Helper) whose own bundle IDs never match the app the user excluded, so each
+    /// audio process is attributed to the app responsible for it (the same mapping
+    /// Activity Monitor uses) before checking the exclude set.
+    private func resolveExcludedAudioProcesses() -> (objects: [AudioObjectID], pids: [pid_t]) {
+        guard !excludedBundleIDs.isEmpty else { return ([], []) }
+        var objects: [AudioObjectID] = []
+        var pids: [pid_t] = []
+        do {
+            for object in try audioProcessObjectIDs() {
+                let processPID = try pid(ofAudioProcess: object)
+                guard processPID > 0 else { continue }
+                let responsiblePID = responsibility_get_pid_responsible_for_pid(processPID)
+                let bundleID = NSRunningApplication(processIdentifier: responsiblePID)?.bundleIdentifier
+                    ?? NSRunningApplication(processIdentifier: processPID)?.bundleIdentifier
+                if let bundleID, excludedBundleIDs.contains(bundleID) {
+                    objects.append(object)
+                    pids.append(processPID)
+                }
+            }
+        } catch {
+            errorMessage = "Exclude-list resolution failed: \(error)"
+        }
+        return (objects, pids)
+    }
+
+    private func restartForExclusionChange() {
+        guard isRunning else { return }
+        stop()
+        start()
+    }
+
+    private var lastExcludedPIDs: [pid_t] = []
+    private var exclusionRecheck: DispatchWorkItem?
+
+    /// Core Audio's process list changed. If the resolved excluded process set
+    /// differs from what the tap was built with, rebuild it (debounced — process
+    /// churn is bursty and each rebuild briefly interrupts audio).
+    private func scheduleExclusionRecheck() {
+        guard isRunning, !excludedBundleIDs.isEmpty else { return }
+        exclusionRecheck?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isRunning else { return }
+            let current = self.resolveExcludedAudioProcesses().pids.sorted()
+            if current != self.lastExcludedPIDs {
+                self.restartForExclusionChange()
+            }
+        }
+        exclusionRecheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     func start() {
         errorMessage = nil
         do {
+            let excluded = resolveExcludedAudioProcesses()
+            engine.excludedProcessObjects = excluded.objects
+            lastExcludedPIDs = excluded.pids.sorted()
             try engine.start()
             isRunning = true
+            loadProfileForCurrentDevice()
             rebuildKernel()
             startPolling()
         } catch {
             errorMessage = String(describing: error)
             engine.stop()
             isRunning = false
+            writeStatusSnapshot()
         }
     }
 
@@ -121,8 +221,62 @@ final class EQController: ObservableObject {
     }
 
     private func settingsChanged() {
+        guard !isApplyingProfile else { return }
         persist()
+        saveProfileForCurrentDevice()
         rebuildKernel()
+    }
+
+    // MARK: - Per-device profiles
+
+    private func storedProfiles() -> [String: DeviceProfile] {
+        guard let data = defaults.data(forKey: "deviceProfiles") else { return [:] }
+        do {
+            return try JSONDecoder().decode([String: DeviceProfile].self, from: data)
+        } catch {
+            // Corrupt store: surface it, keep running with empty profiles.
+            errorMessage = "Failed to decode device profiles: \(error)"
+            return [:]
+        }
+    }
+
+    private func saveProfileForCurrentDevice() {
+        guard let uid = engine.status?.outputDeviceUID else { return }
+        var profiles = storedProfiles()
+        profiles[uid] = DeviceProfile(
+            gains: gains,
+            mode: mode.rawValue,
+            parametricConfig: serializeAPOConfig(EQPreset(preampDB: manualPreampDB, filters: parametricFilters)),
+            manualPreampDB: manualPreampDB,
+            autoPreampEnabled: autoPreampEnabled,
+            eqEnabled: eqEnabled
+        )
+        do {
+            defaults.set(try JSONEncoder().encode(profiles), forKey: "deviceProfiles")
+        } catch {
+            errorMessage = "Failed to encode device profiles: \(error)"
+        }
+    }
+
+    /// Applies the stored profile for the active output device, if any. Without a
+    /// stored profile the current settings carry over (and become that device's
+    /// profile on the next change).
+    private func loadProfileForCurrentDevice() {
+        guard let uid = engine.status?.outputDeviceUID, uid != activeProfileUID else { return }
+        activeProfileUID = uid
+        guard let profile = storedProfiles()[uid] else { return }
+        isApplyingProfile = true
+        defer { isApplyingProfile = false }
+        if profile.gains.count == Self.bands.count {
+            gains = profile.gains
+        }
+        mode = EQMode(rawValue: profile.mode) ?? .graphic
+        manualPreampDB = profile.manualPreampDB
+        autoPreampEnabled = profile.autoPreampEnabled
+        eqEnabled = profile.eqEnabled
+        if let preset = try? parseAPOConfig(profile.parametricConfig) {
+            parametricFilters = preset.filters
+        }
     }
 
     private func persist() {
@@ -131,6 +285,7 @@ final class EQController: ObservableObject {
         defaults.set(autoPreampEnabled, forKey: "autoPreampEnabled")
         defaults.set(eqEnabled, forKey: "eqEnabled")
         defaults.set(mode.rawValue, forKey: "eqMode")
+        defaults.set(limiterEnabled, forKey: "limiterEnabled")
         defaults.set(
             serializeAPOConfig(EQPreset(preampDB: effectivePreampDB, filters: parametricFilters)),
             forKey: "parametricConfig"
@@ -184,7 +339,10 @@ final class EQController: ObservableObject {
         let cascade = activeCascade(sampleRate: sampleRate)
         let preamp = autoPreampEnabled ? autoPreampDB(of: cascade, sampleRate: sampleRate) : manualPreampDB
         effectivePreampDB = preamp
-        guard let kernel = EQKernel(cascade: cascade, preampDB: preamp, sampleRate: sampleRate, maxChannels: 2) else {
+        guard let kernel = EQKernel(
+            cascade: cascade, preampDB: preamp, sampleRate: sampleRate, maxChannels: 2,
+            limiterEnabled: limiterEnabled
+        ) else {
             errorMessage = "EQKernel construction failed (bands: \(gains), preamp: \(preamp))"
             return
         }
@@ -268,6 +426,22 @@ final class EQController: ObservableObject {
         status: \(statusSummary)
         \(diagnosticLines.joined(separator: "\n"))
         """
-        try? snapshot.write(toFile: "/tmp/maceq-spike-status.txt", atomically: true, encoding: .utf8)
+        let processTable = audioProcessTable().joined(separator: "\n")
+        try? (snapshot + "\nexcluded: \(excludedBundleIDs.sorted())\naudio processes:\n" + processTable)
+            .write(toFile: "/tmp/maceq-spike-status.txt", atomically: true, encoding: .utf8)
+    }
+
+    /// Debug: how each live audio process attributes to an app, for diagnosing
+    /// exclude-list matching.
+    private func audioProcessTable() -> [String] {
+        guard let objects = try? audioProcessObjectIDs() else { return ["<process list unavailable>"] }
+        return objects.compactMap { object in
+            guard let processPID = try? pid(ofAudioProcess: object) else { return nil }
+            let coreBundle = (try? bundleID(ofAudioProcess: object)) ?? "-"
+            let directBundle = NSRunningApplication(processIdentifier: processPID)?.bundleIdentifier ?? "-"
+            let responsiblePID = responsibility_get_pid_responsible_for_pid(processPID)
+            let responsibleBundle = NSRunningApplication(processIdentifier: responsiblePID)?.bundleIdentifier ?? "-"
+            return "  pid=\(processPID) core=\(coreBundle) direct=\(directBundle) responsible(\(responsiblePID))=\(responsibleBundle)"
+        }
     }
 }

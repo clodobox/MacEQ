@@ -60,9 +60,10 @@ final class DebugProbe {
     }
 }
 
-/// Snapshot of the running audio path, for display.
+/// Snapshot of the running audio path, for display and per-device profiles.
 struct EngineStatus {
     let outputDeviceName: String
+    let outputDeviceUID: String
     let sampleRate: Double
     let tapFormatDescription: String
     let bufferFrameSize: UInt32
@@ -85,7 +86,15 @@ final class AudioTapEngine {
 
     /// Called on the main queue when the system default output device changes.
     var onDefaultOutputDeviceChanged: (() -> Void)?
+    /// Called on the main queue when Core Audio's process list changes (an app
+    /// started/stopped doing audio). Owners re-check the exclude list on this.
+    var onProcessListChanged: (() -> Void)?
+    /// Core Audio process objects to exclude from the tap (beyond our own process,
+    /// always excluded). Set before start(). Owners resolve these from the exclude
+    /// list and rebuild on onProcessListChanged when the set changes.
+    var excludedProcessObjects: [AudioObjectID] = []
     private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
+    private var processListenerBlock: AudioObjectPropertyListenerBlock?
 
     var isRunning: Bool { ioProcID != nil }
 
@@ -110,6 +119,27 @@ final class AudioTapEngine {
             // Non-fatal: EQ still works, it just won't follow device switches.
             print("warning: default-output listener failed with OSStatus \(status)")
         }
+
+        var processAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let processBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.onProcessListChanged?()
+        }
+        let processStatus = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &processAddress,
+            DispatchQueue.main,
+            processBlock
+        )
+        if processStatus == noErr {
+            processListenerBlock = processBlock
+        } else {
+            // Non-fatal: exclude list won't self-heal when excluded apps launch.
+            print("warning: process-list listener failed with OSStatus \(processStatus)")
+        }
     }
 
     /// Builds the full path: tap -> private aggregate (real output as main sub-device
@@ -124,7 +154,7 @@ final class AudioTapEngine {
         //    Do not touch isExclusive afterwards.
         let selfProcessObject = try processObjectID(forPID: getpid())
         let tapDescription = CATapDescription(
-            stereoGlobalTapButExcludeProcesses: [selfProcessObject]
+            stereoGlobalTapButExcludeProcesses: [selfProcessObject] + excludedProcessObjects
         )
         tapDescription.name = "MacEQ System Tap"
         tapDescription.muteBehavior = .muted
@@ -197,6 +227,7 @@ final class AudioTapEngine {
 
             status = EngineStatus(
                 outputDeviceName: outputName,
+                outputDeviceUID: outputUID,
                 sampleRate: sampleRate,
                 tapFormatDescription: describe(format: tapFormat),
                 bufferFrameSize: bufferFrames
@@ -256,6 +287,19 @@ final class AudioTapEngine {
                 &address,
                 DispatchQueue.main,
                 deviceListenerBlock
+            )
+        }
+        if let processListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyProcessObjectList,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                DispatchQueue.main,
+                processListenerBlock
             )
         }
         stop()

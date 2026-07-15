@@ -15,6 +15,14 @@ public final class EQKernel {
     private let delays: [UnsafeMutablePointer<Float>]
     private let maxChannels: Int
 
+    // Stereo-linked hard-knee peak limiter (safety net after the preamp).
+    // Instant attack guarantees no sample exceeds the threshold; the release
+    // recovers smoothly. State is touched only by the audio thread.
+    private let limiterEnabled: Bool
+    private var limiterGain: Float = 1.0
+    private let limiterThreshold: Float = 0.9886  // -0.1 dBFS
+    private let limiterReleasePerFrame: Float
+
     public let sampleRate: Double
 
     /// - Parameters:
@@ -22,8 +30,12 @@ public final class EQKernel {
     ///   - preampDB: gain applied after filtering, in dB.
     ///   - sampleRate: rate the coefficients were computed for.
     ///   - maxChannels: number of independent channel states to allocate.
-    public init?(cascade: [BiquadCoefficients], preampDB: Double, sampleRate: Double, maxChannels: Int) {
+    ///   - limiterEnabled: apply the stereo-linked safety limiter after the preamp.
+    public init?(cascade: [BiquadCoefficients], preampDB: Double, sampleRate: Double, maxChannels: Int, limiterEnabled: Bool) {
         guard !cascade.isEmpty, maxChannels > 0 else { return nil }
+        self.limiterEnabled = limiterEnabled
+        // ~150 ms release time constant, computed per frame.
+        self.limiterReleasePerFrame = Float(1.0 - exp(-1.0 / (0.15 * sampleRate)))
         var flattened: [Double] = []
         flattened.reserveCapacity(cascade.count * 5)
         for section in cascade {
@@ -70,5 +82,30 @@ public final class EQKernel {
         var gain = preampLinear
         let totalSamples = vDSP_Length(frameCount * channelCount)
         vDSP_vsmul(samples, 1, &gain, samples, 1, totalSamples)
+
+        if limiterEnabled {
+            applyLimiter(samples: samples, frameCount: frameCount, channelCount: channelCount)
+        }
+    }
+
+    private func applyLimiter(samples: UnsafeMutablePointer<Float>, frameCount: Int, channelCount: Int) {
+        var gain = limiterGain
+        for frame in 0..<frameCount {
+            let base = frame * channelCount
+            var framePeak: Float = 0
+            for channel in 0..<channelCount {
+                let magnitude = abs(samples[base + channel])
+                if magnitude > framePeak { framePeak = magnitude }
+            }
+            if framePeak * gain > limiterThreshold {
+                gain = limiterThreshold / framePeak
+            } else {
+                gain += (1.0 - gain) * limiterReleasePerFrame
+            }
+            for channel in 0..<channelCount {
+                samples[base + channel] *= gain
+            }
+        }
+        limiterGain = gain
     }
 }
