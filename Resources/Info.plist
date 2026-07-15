@@ -20,6 +20,8 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.4</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>MacEQ captures the system audio mix in order to apply equalization and play it back through your output device. Audio is processed locally and never recorded or transmitted.</string>
 	<key>NSHumanReadableCopyright</key>

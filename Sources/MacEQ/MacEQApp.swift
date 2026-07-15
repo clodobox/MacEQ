@@ -1,182 +1,233 @@
 import SwiftUI
 
-/// Milestone 0 UI: a single status window to start/stop the passthrough and watch
-/// live stats. This is deliberately not a menu-bar app yet — a visible window makes
-/// the permission prompt and the go/no-go checks easy to observe.
+/// Starts the audio engine at launch (before the menu-bar popover is ever opened)
+/// so the permission prompt appears immediately and EQ is active from login.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static let controller = EQController()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.controller.start()
+    }
+}
+
 @main
 struct MacEQApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
-        WindowGroup("MacEQ — Milestone 0 Spike") {
-            SpikeView()
-                .frame(minWidth: 420, minHeight: 320)
+        MenuBarExtra("MacEQ", systemImage: "slider.vertical.3") {
+            EQPopoverView(controller: AppDelegate.controller)
         }
-        .windowResizability(.contentSize)
+        .menuBarExtraStyle(.window)
     }
 }
 
-@MainActor
-final class SpikeViewModel: ObservableObject {
-    @Published var isRunning: Bool = false
-    @Published var errorMessage: String?
-    @Published var statusLines: [String] = []
-    @Published var callbackCount: UInt64 = 0
-    @Published var framesProcessed: UInt64 = 0
-    @Published var peakDB: Float = -Float.infinity
-    @Published var rmsDB: Float = -Float.infinity
-    @Published var zeroBufferStreak: UInt64 = 0
-    @Published var toneEnabled: Bool = false {
-        didSet { engine.probe.toneEnabled = toneEnabled }
-    }
-    @Published var probeLines: [String] = []
-
-    private let engine = AudioTapEngine()
-    private var pollTimer: Timer?
-
-    func toggle() {
-        if isRunning {
-            stop()
-        } else {
-            start()
-        }
-    }
-
-    private func start() {
-        errorMessage = nil
-        do {
-            try engine.start()
-            guard let status = engine.status else {
-                throw CoreAudioError(call: "engine started but reported no status", status: noErr)
-            }
-            let latencyMS = Double(status.bufferFrameSize) / status.sampleRate * 1000
-            statusLines = [
-                "Output device: \(status.outputDeviceName)",
-                "Sample rate: \(Int(status.sampleRate)) Hz",
-                "Tap format: \(status.tapFormatDescription)",
-                String(format: "IO buffer: %u frames (~%.1f ms per callback)", status.bufferFrameSize, latencyMS),
-            ]
-            isRunning = true
-            startPolling()
-        } catch {
-            errorMessage = String(describing: error)
-            engine.stop()
-        }
-    }
-
-    private func stop() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-        engine.stop()
-        isRunning = false
-        statusLines = []
-    }
-
-    private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                let stats = self.engine.stats
-                self.callbackCount = stats.callbackCount
-                self.framesProcessed = stats.framesProcessed
-                self.peakDB = amplitudeToDB(stats.lastPeak)
-                self.rmsDB = amplitudeToDB(stats.lastRMS)
-                self.zeroBufferStreak = stats.consecutiveZeroBuffers
-
-                let probe = self.engine.probe
-                if probe.layoutCaptured {
-                    let samples = (0..<8)
-                        .map { String(format: "%.4f", probe.firstSamples[$0]) }
-                        .joined(separator: " ")
-                    self.probeLines = [
-                        "Input buffers: \(probe.inputBufferCount) (ch \(probe.inputChannels), \(probe.inputByteSize) B)",
-                        "Output buffers: \(probe.outputBufferCount) (ch \(probe.outputChannels), \(probe.outputByteSize) B)",
-                        "Live input samples: \(samples)",
-                        String(format: "Max sample ever: %.4f", Float(bitPattern: probe.maxSampleEverBits)),
-                        "Tone-mode callbacks: \(probe.toneCallbackCount)",
-                    ] + self.engine.diagnostics()
-                }
-                self.writeStatusSnapshot()
-            }
-        }
-    }
-}
-
-extension SpikeViewModel {
-    /// Debug aid for Milestone 0: mirrors the window's live state to a file so the
-    /// audio path can be inspected without reading the screen.
-    func writeStatusSnapshot() {
-        let snapshot = """
-        timestamp: \(Date())
-        running: \(isRunning)
-        toneEnabled: \(toneEnabled)
-        error: \(errorMessage ?? "none")
-        \(statusLines.joined(separator: "\n"))
-        callbacks: \(callbackCount)
-        frames: \(framesProcessed)
-        peakDB: \(peakDB)
-        rmsDB: \(rmsDB)
-        zeroBufferStreak: \(zeroBufferStreak)
-        \(probeLines.joined(separator: "\n"))
-        """
-        try? snapshot.write(
-            toFile: "/tmp/maceq-spike-status.txt",
-            atomically: true,
-            encoding: .utf8
-        )
-    }
-}
-
-private func amplitudeToDB(_ amplitude: Float) -> Float {
-    amplitude > 0 ? 20 * log10(amplitude) : -Float.infinity
-}
-
-struct SpikeView: View {
-    @StateObject private var model = SpikeViewModel()
+struct EQPopoverView: View {
+    @ObservedObject var controller: EQController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Milestone 0: tap → aggregate → passthrough")
-                .font(.headline)
-
-            Button(model.isRunning ? "Stop passthrough" : "Start passthrough") {
-                model.toggle()
-            }
-            .controlSize(.large)
-
-            if let errorMessage = model.errorMessage {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+            if let errorMessage = controller.errorMessage {
                 Text(errorMessage)
+                    .font(.caption)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
+            bandSliders
+                .opacity(controller.eqEnabled ? 1 : 0.4)
+                .disabled(!controller.eqEnabled)
+            preampRow
+                .opacity(controller.eqEnabled ? 1 : 0.4)
+                .disabled(!controller.eqEnabled)
+            Divider()
+            footer
+        }
+        .padding(16)
+        .frame(width: 400)
+    }
 
-            if model.isRunning {
-                ForEach(model.statusLines, id: \.self) { line in
-                    Text(line).font(.system(.body, design: .monospaced))
+    private var header: some View {
+        HStack {
+            Text("MacEQ")
+                .font(.headline)
+            Spacer()
+            Toggle("", isOn: $controller.eqEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .help("Enable or bypass the equalizer")
+            Menu {
+                Button("Reset All Bands") { controller.resetAllBands() }
+                Divider()
+                if controller.isRunning {
+                    Button("Stop Audio Engine") { controller.stop() }
+                } else {
+                    Button("Start Audio Engine") { controller.start() }
                 }
                 Divider()
-                Toggle("Debug: play 440 Hz test tone (bypasses tap input)", isOn: $model.toneEnabled)
+                Button("Quit MacEQ") { NSApplication.shared.terminate(nil) }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+    }
 
-                Group {
-                    Text("IO callbacks: \(model.callbackCount)")
-                    Text("Frames processed: \(model.framesProcessed)")
-                    Text(String(format: "Peak: %.1f dBFS   RMS: %.1f dBFS", model.peakDB, model.rmsDB))
-                    Text("Consecutive silent callbacks: \(model.zeroBufferStreak)")
-                    ForEach(model.probeLines, id: \.self) { line in
+    private var bandSliders: some View {
+        HStack(alignment: .top, spacing: 6) {
+            dbScale
+            ForEach(Array(EQController.bands.enumerated()), id: \.offset) { index, band in
+                VStack(spacing: 6) {
+                    VerticalSlider(
+                        value: $controller.gains[index],
+                        range: EQController.gainRange
+                    )
+                    .frame(height: 140)
+                    Text(band.label)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(gainLabel(controller.gains[index]))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private var dbScale: some View {
+        VStack {
+            Text("+12")
+            Spacer()
+            Text("0")
+            Spacer()
+            Text("−12")
+        }
+        .font(.system(size: 9, design: .monospaced))
+        .foregroundStyle(.tertiary)
+        .frame(height: 140)
+    }
+
+    private var preampRow: some View {
+        HStack(spacing: 10) {
+            Text("Preamp")
+                .font(.caption)
+            Slider(
+                value: $controller.manualPreampDB,
+                in: EQController.gainRange
+            )
+            .controlSize(.small)
+            .disabled(controller.autoPreampEnabled)
+            Text(String(format: "%+.1f dB", controller.effectivePreampDB))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 56, alignment: .trailing)
+            Toggle("Auto", isOn: $controller.autoPreampEnabled)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+                .help("Automatically lower gain to prevent clipping from boosted bands")
+        }
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(controller.isRunning ? Color.green : Color.red)
+                    .frame(width: 7, height: 7)
+                Text(controller.statusSummary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(controller.diagnosticLines, id: \.self) { line in
                         Text(line)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.tertiary)
                     }
                 }
-                .font(.system(.body, design: .monospaced))
-
-                Text("Play music now. Pass criteria: you hear it once (not doubled), no glitches, and Peak/RMS move with the audio.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("Click Start, grant the system-audio permission when prompted, then play audio in any app. The purple recording indicator in the menu bar is expected.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Text("Diagnostics")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
-
-            Spacer()
         }
-        .padding(20)
+    }
+
+    private func gainLabel(_ gain: Double) -> String {
+        gain == 0 ? "0" : String(format: "%+.0f", gain)
+    }
+}
+
+/// Center-zero vertical slider: fill grows from the middle, gradient accent,
+/// double-click resets to 0, drag snaps to 0.5 dB.
+struct VerticalSlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+
+    private let trackWidth: CGFloat = 5
+    private let knobSize: CGFloat = 13
+    private static let accent = LinearGradient(
+        colors: [Color.purple, Color.blue],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+
+    var body: some View {
+        GeometryReader { geometry in
+            let height = geometry.size.height
+            let knobY = yPosition(for: value, height: height)
+            let centerY = height / 2
+
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.12))
+                    .frame(width: trackWidth)
+                    .frame(maxWidth: .infinity)
+                Rectangle()
+                    .fill(Self.accent)
+                    .frame(width: trackWidth)
+                    .frame(height: abs(centerY - knobY))
+                    .offset(y: min(knobY, centerY))
+                    .frame(maxWidth: .infinity)
+                Rectangle()
+                    .fill(Color.primary.opacity(0.35))
+                    .frame(width: trackWidth + 6, height: 1)
+                    .offset(y: centerY)
+                    .frame(maxWidth: .infinity)
+                Circle()
+                    .fill(Color.white)
+                    .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                    .frame(width: knobSize, height: knobSize)
+                    .offset(y: knobY - knobSize / 2)
+                    .frame(maxWidth: .infinity)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        value = valueFor(y: gesture.location.y, height: height)
+                    }
+            )
+            .onTapGesture(count: 2) {
+                value = 0
+            }
+        }
+    }
+
+    private func yPosition(for value: Double, height: CGFloat) -> CGFloat {
+        let fraction = (value - range.lowerBound) / (range.upperBound - range.lowerBound)
+        return height * CGFloat(1 - fraction)
+    }
+
+    private func valueFor(y: CGFloat, height: CGFloat) -> Double {
+        let fraction = 1 - Double(min(max(y, 0), height) / height)
+        let raw = range.lowerBound + fraction * (range.upperBound - range.lowerBound)
+        return (raw * 2).rounded() / 2
     }
 }

@@ -1,5 +1,14 @@
 import CoreAudio
 import Foundation
+import MacEQCore
+
+/// Hands the current EQ kernel to the audio thread. The IOProc does a single
+/// reference load per callback; `nil` means bypass (pure passthrough). The owner
+/// must keep recently replaced kernels alive briefly (retire list) so the audio
+/// thread's release can never be the final one.
+final class KernelHolder {
+    var kernel: EQKernel?
+}
 
 /// Stats written by the real-time IO thread and polled by the UI.
 ///
@@ -71,9 +80,37 @@ final class AudioTapEngine {
 
     let stats = IOStats()
     let probe = DebugProbe()
+    let kernelHolder = KernelHolder()
     private(set) var status: EngineStatus?
 
+    /// Called on the main queue when the system default output device changes.
+    var onDefaultOutputDeviceChanged: (() -> Void)?
+    private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
+
     var isRunning: Bool { ioProcID != nil }
+
+    init() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.onDefaultOutputDeviceChanged?()
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            block
+        )
+        if status == noErr {
+            deviceListenerBlock = block
+        } else {
+            // Non-fatal: EQ still works, it just won't follow device switches.
+            print("warning: default-output listener failed with OSStatus \(status)")
+        }
+    }
 
     /// Builds the full path: tap -> private aggregate (real output as main sub-device
     /// + tap in the tap list) -> passthrough IOProc -> start.
@@ -137,6 +174,7 @@ final class AudioTapEngine {
             //    no allocation, no locks, no Objective-C/Swift runtime calls that lock.
             let stats = self.stats
             let probe = self.probe
+            let kernelHolder = self.kernelHolder
             try checkOSStatus(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, ioQueue) {
                     _, inInputData, _, outOutputData, _ in
@@ -144,6 +182,9 @@ final class AudioTapEngine {
                         writeTestTone(output: outOutputData, sampleRate: sampleRate, probe: probe)
                     } else {
                         passthrough(input: inInputData, output: outOutputData, stats: stats, probe: probe)
+                        if let kernel = kernelHolder.kernel {
+                            applyKernel(kernel, output: outOutputData)
+                        }
                     }
                 },
                 "AudioDeviceCreateIOProcIDWithBlock"
@@ -204,7 +245,35 @@ final class AudioTapEngine {
     }
 
     deinit {
+        if let deviceListenerBlock {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                DispatchQueue.main,
+                deviceListenerBlock
+            )
+        }
         stop()
+    }
+}
+
+/// Runs the EQ kernel in place on every output buffer. Real-time safe.
+private func applyKernel(_ kernel: EQKernel, output: UnsafeMutablePointer<AudioBufferList>) {
+    let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
+    for buffer in outputBuffers {
+        guard let data = buffer.mData else { continue }
+        let channels = Int(max(buffer.mNumberChannels, 1))
+        let sampleCount = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+        kernel.process(
+            interleaved: data.assumingMemoryBound(to: Float.self),
+            frameCount: sampleCount / channels,
+            channelCount: channels
+        )
     }
 }
 
