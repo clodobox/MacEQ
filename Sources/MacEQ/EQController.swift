@@ -3,6 +3,7 @@ import CoreAudio
 import Foundation
 import MacEQCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// libsystem SPI: the PID of the app responsible for another PID (how Activity
 /// Monitor groups helper processes under their app). Required to match browser
@@ -324,6 +325,40 @@ final class EQController: ObservableObject {
             configParseError = error.description
         } catch {
             configParseError = String(describing: error)
+        }
+    }
+
+    /// Imports an APO/AutoEQ preset file (ParametricEQ.txt, config.txt) chosen
+    /// in an open panel. Parse errors surface via configParseError + errorMessage.
+    func importPresetFromFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose an Equalizer APO / AutoEQ preset (.txt)"
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            applyConfigText(text)
+            if let parseError = configParseError {
+                errorMessage = "Import failed — \(parseError)"
+            }
+        } catch {
+            errorMessage = "Could not read \(url.lastPathComponent): \(error)"
+        }
+    }
+
+    /// Exports the current parametric chain as an APO config.txt file.
+    func exportPresetToFile() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "MacEQ Preset.txt"
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try currentConfigText().write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Could not write \(url.lastPathComponent): \(error)"
         }
     }
 

@@ -83,6 +83,9 @@ struct EQPopoverView: View {
                     NSApplication.shared.activate(ignoringOtherApps: true)
                 }
                 Divider()
+                Button("Import Preset…") { controller.importPresetFromFile() }
+                Button("Export Preset…") { controller.exportPresetToFile() }
+                Divider()
                 if controller.isRunning {
                     Button("Stop Audio Engine") { controller.stop() }
                 } else {

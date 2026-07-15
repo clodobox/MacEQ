@@ -31,6 +31,22 @@ struct ParametricView: View {
             } else {
                 bandTable
             }
+
+            HStack(spacing: 4) {
+                Image(systemName: "lightbulb")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                Text("Free correction profiles for 5000+ headphones:")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Link("AutoEQ", destination: URL(string: "https://github.com/jaakkopasanen/AutoEq/tree/master/results")!)
+                    .font(.caption2)
+                Text("— import the ParametricEQ.txt for your model.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .lineLimit(1)
+            .truncationMode(.tail)
         }
         .onChange(of: showConfigText) { _, shown in
             if shown { configDraft = controller.currentConfigText() }
