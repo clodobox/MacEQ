@@ -7,6 +7,14 @@ without breaking your volume keys.
 
 Made by [Jatin Grewal](https://github.com/jatinindia). MIT licensed.
 
+## [**Download MacEQ**](https://github.com/jatinindia/MacEQ/releases/latest/download/MacEQ.dmg)
+
+**macOS 14.4 or later · Apple Silicon and Intel · 1.4 MB**
+
+That link always serves the newest version. Open the DMG, drag MacEQ into
+Applications, and see [Install](#install) — the first launch needs one extra
+step, because the app isn't signed with a paid Apple certificate.
+
 ---
 
 ## What it is
@@ -26,10 +34,10 @@ app covers both).
 
 ## Install
 
-1. Download `MacEQ.zip` from the
-   [latest release](https://github.com/jatinindia/MacEQ/releases/latest) and
-   unzip it.
-2. Drag `MacEQ.app` to your Applications folder.
+1. [Download `MacEQ.dmg`](https://github.com/jatinindia/MacEQ/releases/latest/download/MacEQ.dmg)
+   and double-click it.
+2. Drag the MacEQ icon onto the Applications folder in the window that opens,
+   then eject the disk image.
 3. The first launch is blocked, because MacEQ isn't signed with a paid Apple
    certificate. This is expected — see
    [Why does macOS block it?](#why-does-macos-block-it) below. To get past it,
@@ -201,7 +209,13 @@ scripts/build-app.sh
 open build/MacEQ.app
 ```
 
-Run the test suite with `swift run maceq-tests`.
+Run the test suite with `swift run maceq-tests`, and package the release disk
+image with `scripts/make-dmg.sh`.
+
+The app icon and the installer backdrop are both generated rather than
+hand-drawn — `scripts/generate-icon.swift` and
+`scripts/generate-dmg-background.swift` are their editable sources, and each
+carries its regeneration steps in the header.
 
 ## How it works
 
