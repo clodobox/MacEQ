@@ -20,12 +20,13 @@ swift build -c "$CONFIGURATION" --triple arm64-apple-macosx
 swift build -c "$CONFIGURATION" --triple x86_64-apple-macosx
 
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 lipo -create \
     "$PROJECT_DIR/.build/arm64-apple-macosx/$CONFIGURATION/MacEQ" \
     "$PROJECT_DIR/.build/x86_64-apple-macosx/$CONFIGURATION/MacEQ" \
     -output "$APP_DIR/Contents/MacOS/MacEQ"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 codesign --force --sign - "$APP_DIR"
 
