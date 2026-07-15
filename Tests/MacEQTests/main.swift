@@ -215,7 +215,158 @@ func testKernelPreampScales() {
     expectClose(tail, 0.5 * pow(10.0, -6.0 / 20.0), tolerance: 0.001, "preamp -6 dB scales amplitude")
 }
 
+// MARK: - All filter types vs independent Python references
+
+func testFilterTypeReferences() {
+    func spec(_ type: FilterType, _ frequency: Double, gain: Double = 0, q: Double = 0) -> FilterSpec {
+        FilterSpec(type: type, isEnabled: true, frequency: frequency, gainDB: gain, q: q)
+    }
+    expectCoefficients(
+        coefficients(for: spec(.lowPass, 1000), sampleRate: 48000),
+        [0.003916126661, 0.007832253321, 0.003916126661, -1.815341082705, 0.831005589347]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.highPassQ, 100, q: 1.2), sampleRate: 48000),
+        [0.994532982734, -1.989065965469, 0.994532982734, -1.988980757765, 0.989151173172]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.bandPass, 1000, q: 2.0), sampleRate: 48000),
+        [0.031600378776, 0.0, -0.031600378776, -1.920229656437, 0.936799242447]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.notch, 60, q: 10.0), sampleRate: 48000),
+        [0.999607459104, -1.999153257712, 0.999607459104, -1.999153257712, 0.999214918209]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.allPass, 500, q: butterworthQ), sampleRate: 48000),
+        [0.911594496600, -1.907501626046, 1.0, -1.907501626046, 0.911594496600]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.lowShelf, 100, gain: 6.0), sampleRate: 48000),
+        [1.003217895737, -1.984364430777, 0.981386698749, -1.984424329139, 0.984544696124]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.highShelf, 8000, gain: 3.0), sampleRate: 44100),
+        [1.241825000347, -0.746711627193, 0.293353733121, -0.413493777491, 0.201960883766]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.lowShelfC, 105, gain: -4.0, q: 0.9), sampleRate: 48000),
+        [0.998231191310, -1.982818954816, 0.984736541566, -1.982775445178, 0.983011242514]
+    )
+    expectCoefficients(
+        coefficients(for: spec(.highShelfC, 10000, gain: -4.0, q: 0.9), sampleRate: 48000),
+        [0.764169852532, -0.146585687696, 0.222245829776, -0.477928081879, 0.317758076491]
+    )
+}
+
+func testFilterTypeMagnitudeSanity() {
+    func mag(_ spec: FilterSpec, at frequency: Double) -> Double {
+        magnitudeDB(of: [coefficients(for: spec, sampleRate: 48000)], sampleRate: 48000, frequency: frequency)
+    }
+    let lowPass = FilterSpec(type: .lowPass, isEnabled: true, frequency: 1000, gainDB: 0, q: 0)
+    expectClose(mag(lowPass, at: 1000), -3.0103, tolerance: 0.01, "Butterworth LP is -3 dB at Fc")
+    expectClose(mag(lowPass, at: 20), 0.0, tolerance: 0.01, "LP passband is flat")
+    expect(mag(lowPass, at: 16000) < -40, "LP stopband attenuates strongly")
+
+    let notch = FilterSpec(type: .notch, isEnabled: true, frequency: 60, gainDB: 0, q: 10)
+    expect(mag(notch, at: 60) < -40, "notch is deep at Fc")
+    expectClose(mag(notch, at: 1000), 0.0, tolerance: 0.05, "notch is flat far from Fc")
+
+    let allPass = FilterSpec(type: .allPass, isEnabled: true, frequency: 500, gainDB: 0, q: butterworthQ)
+    for frequency in [50.0, 500.0, 5000.0] {
+        expectClose(mag(allPass, at: frequency), 0.0, tolerance: 1e-6, "all-pass magnitude is flat at \(frequency)")
+    }
+
+    let lowShelf = FilterSpec(type: .lowShelf, isEnabled: true, frequency: 100, gainDB: 6, q: 0)
+    expectClose(mag(lowShelf, at: 10), 6.0, tolerance: 0.05, "low shelf reaches gain below Fc")
+    expectClose(mag(lowShelf, at: 10000), 0.0, tolerance: 0.05, "low shelf flat above Fc")
+}
+
+// MARK: - APO config.txt parse/serialize
+
+func testAPOParse() {
+    let text = """
+    # AutoEQ export for some headphone
+    Preamp: -6.8 dB
+    Filter 1: ON PK Fc 105 Hz Gain -4.0 dB Q 0.90
+    Filter 2: ON LSC Fc 105 Hz Gain 2.5 dB Q 0.64
+    Filter 3: OFF HP Fc 40 Hz
+    Filter 4: ON PK Fc 1500,5 Hz Gain 3,2 dB Q 2,00
+    Device: some device to ignore
+    Filter 5: ON HSC Fc 10000 Hz Gain -5.4 dB Q 0.70
+    """
+    do {
+        let preset = try parseAPOConfig(text)
+        expectClose(preset.preampDB, -6.8, tolerance: 1e-9, "preamp parsed")
+        expect(preset.filters.count == 5, "5 filters parsed, got \(preset.filters.count)")
+        guard preset.filters.count == 5 else { return }
+        expect(preset.filters[0].type == .peaking, "filter 1 type")
+        expectClose(preset.filters[0].frequency, 105, tolerance: 1e-9, "filter 1 Fc")
+        expectClose(preset.filters[0].gainDB, -4.0, tolerance: 1e-9, "filter 1 gain")
+        expectClose(preset.filters[0].q, 0.9, tolerance: 1e-9, "filter 1 Q")
+        expect(preset.filters[1].type == .lowShelfC, "filter 2 type LSC")
+        expect(!preset.filters[2].isEnabled, "filter 3 is OFF")
+        expect(preset.filters[2].type == .highPass, "filter 3 type HP")
+        expectClose(preset.filters[3].frequency, 1500.5, tolerance: 1e-9, "decimal-comma Fc")
+        expectClose(preset.filters[3].gainDB, 3.2, tolerance: 1e-9, "decimal-comma gain")
+        expect(preset.filters[4].type == .highShelfC, "filter 5 type HSC")
+    } catch {
+        expect(false, "parse threw: \(error)")
+    }
+}
+
+func testAPOParseErrors() {
+    do {
+        _ = try parseAPOConfig("Filter 1: ON XYZ Fc 100 Hz")
+        expect(false, "unknown filter type must throw")
+    } catch let error as APOParseError {
+        expect(error.line == 1, "error carries line number, got \(error.line)")
+    } catch {
+        expect(false, "wrong error type: \(error)")
+    }
+    do {
+        _ = try parseAPOConfig("Preamp: loud dB")
+        expect(false, "malformed preamp must throw")
+    } catch is APOParseError {
+        expect(true, "")
+    } catch {
+        expect(false, "wrong error type: \(error)")
+    }
+}
+
+func testAPORoundTrip() {
+    let original = EQPreset(preampDB: -5.5, filters: [
+        FilterSpec(type: .peaking, isEnabled: true, frequency: 105.5, gainDB: -4.0, q: 0.9),
+        FilterSpec(type: .lowPass, isEnabled: true, frequency: 18000, gainDB: 0, q: butterworthQ),
+        FilterSpec(type: .highShelf, isEnabled: false, frequency: 8000, gainDB: 3.1, q: butterworthQ),
+        FilterSpec(type: .notch, isEnabled: true, frequency: 50, gainDB: 0, q: 30),
+    ])
+    do {
+        let reparsed = try parseAPOConfig(serializeAPOConfig(original))
+        expectClose(reparsed.preampDB, original.preampDB, tolerance: 0.01, "round-trip preamp")
+        expect(reparsed.filters.count == original.filters.count, "round-trip filter count")
+        for (index, pair) in zip(reparsed.filters, original.filters).enumerated() {
+            expect(pair.0.type == pair.1.type, "round-trip type at \(index)")
+            expect(pair.0.isEnabled == pair.1.isEnabled, "round-trip enabled at \(index)")
+            expectClose(pair.0.frequency, pair.1.frequency, tolerance: 0.01, "round-trip Fc at \(index)")
+            if pair.1.type.usesGain {
+                expectClose(pair.0.gainDB, pair.1.gainDB, tolerance: 0.01, "round-trip gain at \(index)")
+            }
+            if pair.1.type.usesQ {
+                expectClose(pair.0.q, pair.1.q, tolerance: 0.01, "round-trip Q at \(index)")
+            }
+        }
+    } catch {
+        expect(false, "round-trip threw: \(error)")
+    }
+}
+
 testPeakingCoefficientReferences()
+testFilterTypeReferences()
+testFilterTypeMagnitudeSanity()
+testAPOParse()
+testAPOParseErrors()
+testAPORoundTrip()
 testMagnitudeResponse()
 testAutoPreamp()
 testLogSpacedFrequencies()

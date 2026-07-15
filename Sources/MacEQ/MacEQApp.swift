@@ -35,12 +35,24 @@ struct EQPopoverView: View {
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
-            bandSliders
-                .opacity(controller.eqEnabled ? 1 : 0.4)
-                .disabled(!controller.eqEnabled)
-            preampRow
-                .opacity(controller.eqEnabled ? 1 : 0.4)
-                .disabled(!controller.eqEnabled)
+            Picker("", selection: $controller.mode) {
+                Text("Graphic").tag(EQMode.graphic)
+                Text("Parametric").tag(EQMode.parametric)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+
+            Group {
+                if controller.mode == .graphic {
+                    bandSliders
+                } else {
+                    ParametricView(controller: controller)
+                }
+                preampRow
+            }
+            .opacity(controller.eqEnabled ? 1 : 0.4)
+            .disabled(!controller.eqEnabled)
             Divider()
             footer
         }

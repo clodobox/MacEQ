@@ -8,6 +8,12 @@ struct EQBand {
     let frequency: Double
 }
 
+/// Which editing surface drives the DSP chain.
+enum EQMode: String {
+    case graphic
+    case parametric
+}
+
 /// UI-facing state for the 10-band graphic EQ. Owns the audio engine, rebuilds
 /// the DSP kernel on every change, persists settings, and mirrors status for
 /// debugging. Main-actor: all mutations come from the UI or main-queue callbacks.
@@ -41,6 +47,14 @@ final class EQController: ObservableObject {
     @Published var eqEnabled: Bool {
         didSet { settingsChanged() }
     }
+    @Published var mode: EQMode {
+        didSet { settingsChanged() }
+    }
+    @Published var parametricFilters: [FilterSpec] {
+        didSet { settingsChanged() }
+    }
+    /// Last parse error from the config text editor, shown inline.
+    @Published var configParseError: String?
 
     @Published private(set) var isRunning = false
     @Published private(set) var errorMessage: String?
@@ -64,6 +78,14 @@ final class EQController: ObservableObject {
         manualPreampDB = defaults.object(forKey: "preampDB") as? Double ?? 0.0
         autoPreampEnabled = defaults.object(forKey: "autoPreampEnabled") as? Bool ?? true
         eqEnabled = defaults.object(forKey: "eqEnabled") as? Bool ?? true
+        mode = EQMode(rawValue: defaults.string(forKey: "eqMode") ?? "") ?? .graphic
+        // Parametric state persists in the native APO config.txt format.
+        if let storedConfig = defaults.string(forKey: "parametricConfig"),
+           let preset = try? parseAPOConfig(storedConfig) {
+            parametricFilters = preset.filters
+        } else {
+            parametricFilters = []
+        }
 
         engine.onDefaultOutputDeviceChanged = { [weak self] in
             self?.handleDeviceChange()
@@ -108,6 +130,46 @@ final class EQController: ObservableObject {
         defaults.set(manualPreampDB, forKey: "preampDB")
         defaults.set(autoPreampEnabled, forKey: "autoPreampEnabled")
         defaults.set(eqEnabled, forKey: "eqEnabled")
+        defaults.set(mode.rawValue, forKey: "eqMode")
+        defaults.set(
+            serializeAPOConfig(EQPreset(preampDB: effectivePreampDB, filters: parametricFilters)),
+            forKey: "parametricConfig"
+        )
+    }
+
+    // MARK: - Parametric editing
+
+    func addParametricBand() {
+        parametricFilters.append(
+            FilterSpec(type: .peaking, isEnabled: true, frequency: 1000, gainDB: 0, q: 1.0)
+        )
+    }
+
+    func removeParametricBand(at index: Int) {
+        guard parametricFilters.indices.contains(index) else { return }
+        parametricFilters.remove(at: index)
+    }
+
+    /// The live APO config text for the editor tab.
+    func currentConfigText() -> String {
+        serializeAPOConfig(EQPreset(preampDB: effectivePreampDB, filters: parametricFilters))
+    }
+
+    /// Applies edited/pasted APO config text (also the AutoEQ import path).
+    /// Sets `configParseError` instead of throwing so the editor can show it inline.
+    func applyConfigText(_ text: String) {
+        do {
+            let preset = try parseAPOConfig(text)
+            configParseError = nil
+            autoPreampEnabled = false
+            manualPreampDB = preset.preampDB
+            parametricFilters = preset.filters
+            mode = .parametric
+        } catch let error as APOParseError {
+            configParseError = error.description
+        } catch {
+            configParseError = String(describing: error)
+        }
     }
 
     /// Builds a fresh kernel off the audio thread and swaps it in. nil = bypass.
@@ -119,9 +181,7 @@ final class EQController: ObservableObject {
             return
         }
         let sampleRate = engine.status?.sampleRate ?? 48000
-        let cascade = zip(Self.bands, gains).map { band, gain in
-            peakingCoefficients(sampleRate: sampleRate, frequency: band.frequency, q: Self.bandQ, gainDB: gain)
-        }
+        let cascade = activeCascade(sampleRate: sampleRate)
         let preamp = autoPreampEnabled ? autoPreampDB(of: cascade, sampleRate: sampleRate) : manualPreampDB
         effectivePreampDB = preamp
         guard let kernel = EQKernel(cascade: cascade, preampDB: preamp, sampleRate: sampleRate, maxChannels: 2) else {
@@ -130,6 +190,27 @@ final class EQController: ObservableObject {
         }
         retire(engine.kernelHolder.kernel)
         engine.kernelHolder.kernel = kernel
+    }
+
+    /// The biquad cascade for the current mode. Never empty: an identity peaking
+    /// section stands in when the parametric list has no enabled filters.
+    func activeCascade(sampleRate: Double) -> [BiquadCoefficients] {
+        switch mode {
+        case .graphic:
+            return zip(Self.bands, gains).map { band, gain in
+                peakingCoefficients(sampleRate: sampleRate, frequency: band.frequency, q: Self.bandQ, gainDB: gain)
+            }
+        case .parametric:
+            let enabled = parametricFilters.filter(\.isEnabled)
+            guard !enabled.isEmpty else {
+                return [peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 1.0, gainDB: 0)]
+            }
+            return enabled.map { coefficients(for: $0, sampleRate: sampleRate) }
+        }
+    }
+
+    var currentSampleRate: Double {
+        engine.status?.sampleRate ?? 48000
     }
 
     private func retire(_ kernel: EQKernel?) {
