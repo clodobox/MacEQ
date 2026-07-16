@@ -32,6 +32,13 @@ AirPods stay AirPods, volume keys keep working.
 **Requirements:** macOS 14.4 or later, Apple Silicon or Intel (one universal
 app covers both).
 
+macOS 14.4 is a hard floor, not a recommendation. The process-tap API MacEQ is
+built on didn't exist before Sonoma 14.4, so there's no version of MacEQ that
+runs on Ventura (macOS 13) or earlier — the system calls it needs simply aren't
+there. Equalizing system audio on those releases requires a virtual audio
+driver instead, which is exactly the admin-password, broken-volume-keys
+approach MacEQ was written to avoid.
+
 ## Install
 
 1. [Download `MacEQ.dmg`](https://github.com/jatinindia/MacEQ/releases/latest/download/MacEQ.dmg)
