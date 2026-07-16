@@ -80,6 +80,18 @@ tell application "Finder"
 end tell
 APPLESCRIPT
 
+# A raw .dmg file can't carry a custom icon — that data is filesystem
+# metadata (extended attributes) and gets stripped by any byte-stream
+# transfer, including GitHub Releases. The mounted *volume* is different:
+# its icon lives inside the DMG's own HFS+ filesystem, so it does survive
+# distribution. Reuses the app icon so the drive matches the app once mounted.
+#
+# Written here, after the Finder styling above, not earlier: Finder's own
+# "update" call deletes an unrecognized dotfile like .VolumeIcon.icns if
+# it's present beforehand, so writing it any earlier is silently undone.
+cp "$PROJECT_DIR/Resources/AppIcon.icns" "$MOUNT_POINT/.VolumeIcon.icns"
+SetFile -a C "$MOUNT_POINT"
+
 sync
 hdiutil detach "$MOUNT_POINT" >/dev/null
 trap - EXIT

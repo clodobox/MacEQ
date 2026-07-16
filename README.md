@@ -7,7 +7,7 @@ without breaking your volume keys.
 
 Made by [Jatin Grewal](https://github.com/jatinindia). MIT licensed.
 
-## [**Download MacEQ**](https://github.com/jatinindia/MacEQ/releases/latest/download/MacEQ.dmg)
+[![Download MacEQ.dmg](https://img.shields.io/badge/Download-MacEQ.dmg-blue?style=for-the-badge&logo=apple)](https://github.com/jatinindia/MacEQ/releases/latest/download/MacEQ.dmg)
 
 **macOS 14.4 or later · Apple Silicon and Intel · 1.4 MB**
 
