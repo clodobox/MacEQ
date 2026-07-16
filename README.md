@@ -63,7 +63,9 @@ There is no Dock icon and no main window. MacEQ is a menu-bar-only app.
 
 ## Features
 
-- **10-band graphic EQ** — the quick way to shape sound. 31 Hz to 16 kHz, ±12 dB.
+- **Graphic EQ with editable bands** — the quick way to shape sound. Starts as
+  the classic 10-band octave layout (31 Hz to 16 kHz, ±12 dB); add bands at any
+  frequency with the **+** button (up to 16) or right-click a band to remove it.
 - **Full parametric EQ** — 12 filter types, unlimited bands, a draggable
   response curve with a live spectrum analyzer behind it.
 - **AutoEQ support** — free correction profiles for 5000+ headphone models
@@ -91,7 +93,8 @@ There is no Dock icon and no main window. MacEQ is a menu-bar-only app.
 | --- | --- |
 | **Switch (top right)** | Master bypass. Off = your audio passes through untouched. Same as pressing the hotkey. |
 | **Graphic / Parametric** | Switches editors. Each mode keeps its own settings, and only the active mode is applied to the audio. |
-| **Reset** (graphic mode) | Sets all 10 bands back to 0 dB. Affects **only the current output device's** profile. |
+| **+** (graphic mode) | Adds a band at any frequency you type (20 Hz – 20 kHz, up to 16 bands). **Right-click a band to remove it.** |
+| **Reset** (graphic mode) | Sets all bands back to 0 dB. Affects **only the current output device's** profile. |
 | **Band sliders** | Boost/cut that frequency, ±12 dB. Drag snaps to 0.5 dB steps; **double-click a slider to reset it** to 0. |
 | **Preamp** | Overall level before the EQ. Boosting bands adds energy and can clip; the preamp pulls it back. |
 | **Auto** (next to Preamp) | Computes the preamp for you from the current band gains so nothing clips. Leave this on unless you want manual control — it disables the preamp slider while active. |
@@ -117,6 +120,7 @@ There is no Dock icon and no main window. MacEQ is a menu-bar-only app.
 | Item | What it does |
 | --- | --- |
 | **Reset All Bands** | Same as the Reset button: all graphic bands to 0 dB, current device only. |
+| **Restore Default Bands** | Puts the graphic EQ back to the classic 10-band octave layout. Gains carry over for frequencies present in both layouts. |
 | **Safety Limiter** | Catches overshoots so a heavy boost distorts instead of blasting you. Recommended on. |
 | **Launch at Login** | Starts MacEQ automatically when you log in. |
 | **Change Hotkey…** | Records a new global shortcut. Must include ⌘, ⌥ or ⌃. Esc cancels. If the combo is taken by another app, MacEQ says so instead of silently failing. |
@@ -201,6 +205,8 @@ and replace the app in Applications. Your settings and presets are kept.
 | No permission prompt appeared | System Settings → Privacy & Security → check MacEQ under audio recording. |
 | Permission prompt returns after every rebuild | Expected with ad-hoc signing. Reset with `tccutil reset SystemAudioCaptureRequests com.jatingrewal.maceq`. |
 | Distortion on heavy boosts | Turn on **Auto** preamp and **Safety Limiter**. |
+| Everything gets quieter when the EQ is on | That's the **Auto preamp** doing its job: with boosted bands it lowers the overall level by the size of your largest boost so it can't clip. The exact cut is shown next to the Preamp slider. Uncheck **Auto** to keep loudness (the limiter still protects against clipping), or use cuts instead of boosts. With all bands flat, MacEQ is acoustically transparent — measurably identical to bypass. |
+| Audio mutes right after first launch | Answer the system-audio permission dialog — audio stays muted while the prompt is open. |
 | Crackles/dropouts | ⋯ → Buffer Size → a larger value. |
 | Nothing is equalized | Check the master switch is on, and that the app isn't in the exclude list. |
 

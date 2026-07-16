@@ -37,6 +37,8 @@ struct DeviceProfile: Codable {
     // Optional so profiles saved before convolution existed still decode.
     var impulseResponsePath: String?
     var convolutionEnabled: Bool?
+    // Optional so profiles saved before custom bands existed still decode.
+    var bandFrequencies: [Double]?
 }
 
 /// Live spectrum levels, kept out of EQController on purpose: the popover
@@ -66,6 +68,8 @@ struct NamedPreset: Codable {
     var parametricConfig: String
     var manualPreampDB: Double
     var autoPreampEnabled: Bool
+    // Optional so presets saved before custom bands existed still decode.
+    var bandFrequencies: [Double]?
 }
 
 /// UI-facing state for the 10-band graphic EQ. Owns the audio engine, rebuilds
@@ -73,18 +77,10 @@ struct NamedPreset: Codable {
 /// debugging. Main-actor: all mutations come from the UI or main-queue callbacks.
 @MainActor
 final class EQController: ObservableObject {
-    static let bands: [EQBand] = [
-        EQBand(label: "31", frequency: 31.5),
-        EQBand(label: "63", frequency: 63),
-        EQBand(label: "125", frequency: 125),
-        EQBand(label: "250", frequency: 250),
-        EQBand(label: "500", frequency: 500),
-        EQBand(label: "1k", frequency: 1000),
-        EQBand(label: "2k", frequency: 2000),
-        EQBand(label: "4k", frequency: 4000),
-        EQBand(label: "8k", frequency: 8000),
-        EQBand(label: "16k", frequency: 16000),
-    ]
+    /// Graphic-EQ bands, user-editable (add/remove) and persisted. Always kept
+    /// index-aligned with `gains` — every mutation goes through the add/remove/
+    /// restore methods below, which update both together.
+    @Published private(set) var bands: [EQBand]
     /// PRD choice for octave-band graphic EQ.
     static let bandQ = 2.2
     static let gainRange: ClosedRange<Double> = -12...12
@@ -171,7 +167,18 @@ final class EQController: ObservableObject {
     private var impulseResponseURL: URL?
     /// One block of added latency; 512 frames ≈ 10.7 ms at 48 kHz.
     static let convolutionBlockSize = 512
-    private var pollTimer: Timer?
+    /// Always-on while running: the zero-buffer watchdog's heartbeat. Slow on
+    /// purpose — the status display has its own timer, gated on visibility.
+    private var watchdogTimer: Timer?
+    /// Runs only while the popover is on screen: status formatting and the
+    /// Core Audio diagnostic queries are pure display work, and burning them
+    /// twice a second around the clock was the bulk of MacEQ's idle CPU.
+    private var statusTimer: Timer?
+    /// Set by the popover's onAppear/onDisappear (same mechanism the spectrum
+    /// display already uses).
+    var popoverIsVisible = false {
+        didSet { updateStatusPolling() }
+    }
     private let defaults = UserDefaults.standard
     /// Suppresses persistence/kernel rebuilds while a device profile is being applied.
     private var isApplyingProfile = false
@@ -179,10 +186,13 @@ final class EQController: ObservableObject {
     private var activeProfileUID: String?
 
     init() {
+        let frequencies = defaults.array(forKey: "bandFrequencies") as? [Double]
+            ?? defaultGraphicBandFrequencies
+        bands = frequencies.map { EQBand(label: graphicBandLabel(frequency: $0), frequency: $0) }
         let storedGains = defaults.array(forKey: "bandGains") as? [Double]
-        gains = storedGains?.count == Self.bands.count
+        gains = storedGains?.count == frequencies.count
             ? storedGains!
-            : Array(repeating: 0.0, count: Self.bands.count)
+            : Array(repeating: 0.0, count: frequencies.count)
         manualPreampDB = defaults.object(forKey: "preampDB") as? Double ?? 0.0
         autoPreampEnabled = defaults.object(forKey: "autoPreampEnabled") as? Bool ?? true
         eqEnabled = defaults.object(forKey: "eqEnabled") as? Bool ?? true
@@ -213,6 +223,7 @@ final class EQController: ObservableObject {
             self?.handleDeviceChange()
         }
         engine.onProcessListChanged = { [weak self] in
+            self?.processListChangedSinceScan = true
             self?.scheduleExclusionRecheck()
         }
         engine.onSampleRateChanged = { [weak self] in
@@ -297,8 +308,10 @@ final class EQController: ObservableObject {
     }
 
     func stop() {
-        pollTimer?.invalidate()
-        pollTimer = nil
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        statusTimer?.invalidate()
+        statusTimer = nil
         engine.kernelHolder.kernel = nil
         retireConvolver(engine.convolverHolder.convolver)
         engine.convolverHolder.convolver = nil
@@ -309,7 +322,48 @@ final class EQController: ObservableObject {
     }
 
     func resetAllBands() {
-        gains = Array(repeating: 0.0, count: Self.bands.count)
+        gains = Array(repeating: 0.0, count: bands.count)
+    }
+
+    // MARK: - Graphic band editing
+
+    /// Adds a graphic band at `frequency` with 0 dB gain, keeping the list
+    /// sorted. Returns false (and surfaces the reason) for invalid frequencies.
+    func addGraphicBand(frequency: Double) -> Bool {
+        do {
+            let result = try insertGraphicBand(frequency: frequency, into: bands.map(\.frequency))
+            bands = result.frequencies.map {
+                EQBand(label: graphicBandLabel(frequency: $0), frequency: $0)
+            }
+            gains.insert(0, at: result.index)
+            return true
+        } catch {
+            errorMessage = String(describing: error)
+            return false
+        }
+    }
+
+    func removeGraphicBand(at index: Int) {
+        do {
+            let frequencies = try MacEQCore.removeGraphicBand(at: index, from: bands.map(\.frequency))
+            bands = frequencies.map { EQBand(label: graphicBandLabel(frequency: $0), frequency: $0) }
+            gains.remove(at: index)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    /// Back to the classic 10-band octave layout. Gains carry over for
+    /// frequencies present in both layouts; new bands start at 0 dB.
+    func restoreDefaultGraphicBands() {
+        let currentGains = Dictionary(
+            zip(bands.map(\.frequency), gains),
+            uniquingKeysWith: { first, _ in first }
+        )
+        bands = defaultGraphicBandFrequencies.map {
+            EQBand(label: graphicBandLabel(frequency: $0), frequency: $0)
+        }
+        gains = defaultGraphicBandFrequencies.map { currentGains[$0] ?? 0 }
     }
 
     private func settingsChanged() {
@@ -343,7 +397,8 @@ final class EQController: ObservableObject {
             autoPreampEnabled: autoPreampEnabled,
             eqEnabled: eqEnabled,
             impulseResponsePath: impulseResponseURL?.path,
-            convolutionEnabled: convolutionEnabled
+            convolutionEnabled: convolutionEnabled,
+            bandFrequencies: bands.map(\.frequency)
         )
         do {
             defaults.set(try JSONEncoder().encode(profiles), forKey: "deviceProfiles")
@@ -361,7 +416,10 @@ final class EQController: ObservableObject {
         guard let profile = storedProfiles()[uid] else { return }
         isApplyingProfile = true
         defer { isApplyingProfile = false }
-        if profile.gains.count == Self.bands.count {
+        if let frequencies = profile.bandFrequencies, frequencies.count == profile.gains.count {
+            bands = frequencies.map { EQBand(label: graphicBandLabel(frequency: $0), frequency: $0) }
+            gains = profile.gains
+        } else if profile.gains.count == bands.count {
             gains = profile.gains
         }
         mode = EQMode(rawValue: profile.mode) ?? .graphic
@@ -382,6 +440,7 @@ final class EQController: ObservableObject {
     }
 
     private func persist() {
+        defaults.set(bands.map(\.frequency), forKey: "bandFrequencies")
         defaults.set(gains, forKey: "bandGains")
         defaults.set(manualPreampDB, forKey: "preampDB")
         defaults.set(autoPreampEnabled, forKey: "autoPreampEnabled")
@@ -478,7 +537,8 @@ final class EQController: ObservableObject {
                 EQPreset(preampDB: manualPreampDB, filters: parametricFilters)
             ),
             manualPreampDB: manualPreampDB,
-            autoPreampEnabled: autoPreampEnabled
+            autoPreampEnabled: autoPreampEnabled,
+            bandFrequencies: bands.map(\.frequency)
         )
         namedPresets.removeAll { $0.name == trimmed }
         namedPresets.append(preset)
@@ -488,7 +548,10 @@ final class EQController: ObservableObject {
     /// Applies a named preset to the current device (one rebuild, not one per field).
     func applyPreset(_ preset: NamedPreset) {
         isApplyingProfile = true
-        if preset.gains.count == Self.bands.count {
+        if let frequencies = preset.bandFrequencies, frequencies.count == preset.gains.count {
+            bands = frequencies.map { EQBand(label: graphicBandLabel(frequency: $0), frequency: $0) }
+            gains = preset.gains
+        } else if preset.gains.count == bands.count {
             gains = preset.gains
         }
         mode = EQMode(rawValue: preset.mode) ?? mode
@@ -606,7 +669,7 @@ final class EQController: ObservableObject {
     func activeCascade(sampleRate: Double) -> [BiquadCoefficients] {
         switch mode {
         case .graphic:
-            return zip(Self.bands, gains).map { band, gain in
+            return zip(bands, gains).map { band, gain in
                 peakingCoefficients(sampleRate: sampleRate, frequency: band.frequency, q: Self.bandQ, gainDB: gain)
             }
         case .parametric:
@@ -681,11 +744,24 @@ final class EQController: ObservableObject {
     /// path. A false positive only restarts during real silence, which is inaudible.
     private var lastWatchdogRestart: Date?
     private var watchdogRestartCount = 0
+    private var lastWatchdogProcessScan: Date?
+    /// Set on Core Audio process-list changes so a newly started audio app is
+    /// scanned at the next watchdog tick instead of waiting out the throttle.
+    private var processListChangedSinceScan = true
 
     private func checkZeroBufferWatchdog(status: EngineStatus, stats: IOStats) {
         let callbacksPerSecond = status.sampleRate / Double(max(status.bufferFrameSize, 1))
         guard Double(stats.consecutiveZeroBuffers) > 3 * callbacksPerSecond else { return }
         if let lastWatchdogRestart, Date().timeIntervalSince(lastWatchdogRestart) < 30 { return }
+        // The zero streak persists for as long as the system is genuinely silent,
+        // so without a throttle this scan (every Core Audio process object, three
+        // property reads each) would run on every tick around the clock. Scan
+        // when the process list changed, else at most every 10 s.
+        let scanIsDue = processListChangedSinceScan
+            || lastWatchdogProcessScan.map { Date().timeIntervalSince($0) >= 10 } ?? true
+        guard scanIsDue else { return }
+        lastWatchdogProcessScan = Date()
+        processListChangedSinceScan = false
         guard otherAudioProcessIsPlaying() else { return }
         watchdogRestartCount += 1
         lastWatchdogRestart = Date()
@@ -762,7 +838,22 @@ final class EQController: ObservableObject {
     }
 
     private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard let status = self.engine.status else { return }
+                self.checkZeroBufferWatchdog(status: status, stats: self.engine.stats)
+            }
+        }
+        updateStatusPolling()
+    }
+
+    private func updateStatusPolling() {
+        statusTimer?.invalidate()
+        statusTimer = nil
+        guard isRunning, popoverIsVisible else { return }
+        refreshStatus()  // immediately, so the footer isn't stale on open
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 self.refreshStatus()
@@ -797,7 +888,6 @@ final class EQController: ObservableObject {
             ))
         }
         statusModel.diagnosticLines = lines + convolutionDiagnostics(sampleRate: status.sampleRate) + engine.diagnostics()
-        checkZeroBufferWatchdog(status: status, stats: stats)
     }
 
     private func convolutionDiagnostics(sampleRate: Double) -> [String] {

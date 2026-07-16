@@ -664,6 +664,92 @@ func testImpulseResponseLoaderRoundTripAndResample() {
     }
 }
 
+// MARK: - Graphic EQ band editing
+
+func testGraphicBandDefaults() {
+    expect(defaultGraphicBandFrequencies.count == 10, "10 default bands")
+    expect(defaultGraphicBandFrequencies.first == 31.5, "first default band is 31.5 Hz")
+    expect(defaultGraphicBandFrequencies.last == 16000, "last default band is 16 kHz")
+    expect(
+        defaultGraphicBandFrequencies == defaultGraphicBandFrequencies.sorted(),
+        "default bands are sorted ascending"
+    )
+}
+
+func testGraphicBandLabels() {
+    expect(graphicBandLabel(frequency: 31.5) == "31", "31.5 -> 31, got \(graphicBandLabel(frequency: 31.5))")
+    expect(graphicBandLabel(frequency: 63) == "63", "63 -> 63")
+    expect(graphicBandLabel(frequency: 500) == "500", "500 -> 500")
+    expect(graphicBandLabel(frequency: 1000) == "1k", "1000 -> 1k")
+    expect(graphicBandLabel(frequency: 2500) == "2.5k", "2500 -> 2.5k, got \(graphicBandLabel(frequency: 2500))")
+    expect(graphicBandLabel(frequency: 16000) == "16k", "16000 -> 16k")
+}
+
+func testGraphicBandInsertion() {
+    do {
+        let result = try insertGraphicBand(frequency: 750, into: defaultGraphicBandFrequencies)
+        expect(result.frequencies.count == 11, "insertion grows list by one")
+        expect(result.index == 5, "750 Hz lands between 500 and 1k, got index \(result.index)")
+        expect(result.frequencies[result.index] == 750, "inserted frequency is at returned index")
+        expect(
+            result.frequencies == result.frequencies.sorted(),
+            "list stays sorted after insertion"
+        )
+    } catch {
+        expect(false, "valid insertion threw: \(error)")
+    }
+
+    do {
+        _ = try insertGraphicBand(frequency: 10, into: defaultGraphicBandFrequencies)
+        expect(false, "10 Hz is out of range and should throw")
+    } catch {
+        expect(true, "out-of-range frequency throws")
+    }
+
+    do {
+        _ = try insertGraphicBand(frequency: 1010, into: defaultGraphicBandFrequencies)
+        expect(false, "1010 Hz is within 5% of 1 kHz and should throw")
+    } catch {
+        expect(true, "near-duplicate frequency throws")
+    }
+
+    do {
+        var frequencies = defaultGraphicBandFrequencies
+        for f in [45.0, 90.0, 180.0, 350.0, 700.0, 1400.0] {
+            frequencies = try insertGraphicBand(frequency: f, into: frequencies).frequencies
+        }
+        expect(frequencies.count == 16, "16 bands allowed")
+        _ = try insertGraphicBand(frequency: 2800, into: frequencies)
+        expect(false, "17th band should throw")
+    } catch {
+        expect(true, "band cap enforced")
+    }
+}
+
+func testGraphicBandRemoval() {
+    do {
+        let result = try removeGraphicBand(at: 0, from: defaultGraphicBandFrequencies)
+        expect(result.count == 9, "removal shrinks list by one")
+        expect(result.first == 63, "removing index 0 leaves 63 first")
+    } catch {
+        expect(false, "valid removal threw: \(error)")
+    }
+
+    do {
+        _ = try removeGraphicBand(at: 0, from: [1000])
+        expect(false, "removing the last remaining band should throw")
+    } catch {
+        expect(true, "minimum of one band enforced")
+    }
+
+    do {
+        _ = try removeGraphicBand(at: 42, from: defaultGraphicBandFrequencies)
+        expect(false, "out-of-bounds index should throw")
+    } catch {
+        expect(true, "out-of-bounds removal throws")
+    }
+}
+
 testLimiterCatchesOvers()
 testLimiterTransparentBelowThreshold()
 testSpectrumAnalyzerFindsSine()
@@ -672,6 +758,10 @@ testConvolverMatchesDirectConvolution()
 testConvolverStereoUsesPerChannelIR()
 testConvolverRejectsInvalidConstruction()
 testImpulseResponseLoaderRoundTripAndResample()
+testGraphicBandDefaults()
+testGraphicBandLabels()
+testGraphicBandInsertion()
+testGraphicBandRemoval()
 
 if failureCount > 0 {
     print("\(failureCount) of \(expectationCount) expectations FAILED")

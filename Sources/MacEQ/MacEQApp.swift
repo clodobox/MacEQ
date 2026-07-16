@@ -47,6 +47,8 @@ struct MacEQApp: App {
 struct EQPopoverView: View {
     @ObservedObject var controller: EQController
     @Environment(\.openWindow) private var openWindow
+    @State private var showAddBand = false
+    @State private var addBandText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -67,12 +69,22 @@ struct EQPopoverView: View {
                 .controlSize(.small)
                 if controller.mode == .graphic {
                     Spacer()
+                    Button {
+                        showAddBand.toggle()
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .controlSize(.small)
+                    .help("Add a band at a custom frequency")
                     Button("Reset") {
                         controller.resetAllBands()
                     }
                     .controlSize(.small)
                     .help("Reset all bands to 0 dB (this device's profile only)")
                 }
+            }
+            if controller.mode == .graphic, showAddBand {
+                addBandRow
             }
 
             Group {
@@ -90,6 +102,8 @@ struct EQPopoverView: View {
         }
         .padding(16)
         .frame(width: 400)
+        .onAppear { controller.popoverIsVisible = true }
+        .onDisappear { controller.popoverIsVisible = false }
     }
 
     private var header: some View {
@@ -103,6 +117,7 @@ struct EQPopoverView: View {
                 .help("Enable or bypass the equalizer (\(controller.hotkeyDisplay) anywhere)")
             Menu {
                 Button("Reset All Bands") { controller.resetAllBands() }
+                Button("Restore Default Bands") { controller.restoreDefaultGraphicBands() }
                 Toggle("Safety Limiter", isOn: $controller.limiterEnabled)
                 Toggle("Launch at Login", isOn: $controller.launchAtLogin)
                 Button("Change Hotkey… (\(controller.hotkeyDisplay))") {
@@ -173,10 +188,34 @@ struct EQPopoverView: View {
         }
     }
 
+    private var addBandRow: some View {
+        HStack(spacing: 8) {
+            TextField("Frequency in Hz (20–20000)", text: $addBandText)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.small)
+                .onSubmit(addBand)
+            Button("Add") { addBand() }
+                .controlSize(.small)
+                .disabled(Double(addBandText) == nil)
+            Text("Right-click a band to remove it.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func addBand() {
+        guard let frequency = Double(addBandText) else { return }
+        if controller.addGraphicBand(frequency: frequency) {
+            addBandText = ""
+            showAddBand = false
+        }
+    }
+
     private var bandSliders: some View {
         HStack(alignment: .top, spacing: 6) {
             dbScale
-            ForEach(Array(EQController.bands.enumerated()), id: \.offset) { index, band in
+            ForEach(controller.bands.indices, id: \.self) { index in
+                let band = controller.bands[index]
                 VStack(spacing: 6) {
                     VerticalSlider(
                         value: $controller.gains[index],
@@ -191,6 +230,12 @@ struct EQPopoverView: View {
                         .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity)
+                .contextMenu {
+                    Button("Remove \(band.label) Band", role: .destructive) {
+                        controller.removeGraphicBand(at: index)
+                    }
+                    .disabled(controller.bands.count == 1)
+                }
             }
         }
     }
