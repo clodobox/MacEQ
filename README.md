@@ -9,7 +9,7 @@ Made by [Jatin Grewal](https://github.com/jatinindia). MIT licensed.
 
 [![Download MacEQ.dmg](https://img.shields.io/badge/Download-MacEQ.dmg-blue?style=for-the-badge&logo=apple)](https://github.com/jatinindia/MacEQ/releases/latest/download/MacEQ.dmg)
 
-**macOS 14.4 or later · Apple Silicon and Intel · 1.4 MB**
+**macOS 14.4 or later · Apple Silicon and Intel · 2.4 MB**
 
 That link always serves the newest version. Open the DMG, drag MacEQ into
 Applications, and see [Install](#install) — the first launch needs one extra
@@ -179,7 +179,7 @@ be careful about which apps you grant it to, this one included.
 **The trust gap you should know about:** MacEQ is ad-hoc signed, not signed with
 an Apple Developer ID and not notarized. Practically, that means macOS can't
 verify who built the app, so it warns you on first launch. It also means a
-released `.zip` carries no signature proving it came from this repository. If you
+released `.dmg` carries no signature proving it came from this repository. If you
 want certainty, build it from source yourself — it's two commands, below. Signing
 and notarizing properly needs a paid Apple Developer account and is on the list.
 
@@ -196,8 +196,10 @@ same caution applies to every unsigned app you download, this one included.
 ## Updating
 
 MacEQ does **not** update itself. New versions are published on the
-[releases page](https://github.com/jatinindia/MacEQ/releases) — download, unzip,
-and replace the app in Applications. Your settings and presets are kept.
+[releases page](https://github.com/jatinindia/MacEQ/releases) — download the
+DMG, drag the new MacEQ onto Applications, and confirm the replacement. Quit
+MacEQ from the menu bar first if it is running. Your settings and presets are
+kept. Check your version in **⋯ → About MacEQ**.
 
 ## Troubleshooting
 
