@@ -65,7 +65,9 @@ There is no Dock icon and no main window. MacEQ is a menu-bar-only app.
 
 - **Graphic EQ with editable bands** — the quick way to shape sound. Starts as
   the classic 10-band octave layout (31 Hz to 16 kHz, ±12 dB); add bands at any
-  frequency with the **+** button (up to 16) or right-click a band to remove it.
+  frequency with the **+** button (up to 16), click a band's frequency label to
+  retune it, or right-click a band to remove it. Band layouts are saved per
+  output device and inside named presets.
 - **Full parametric EQ** — 12 filter types, unlimited bands, a draggable
   response curve with a live spectrum analyzer behind it.
 - **AutoEQ support** — free correction profiles for 5000+ headphone models
@@ -96,6 +98,7 @@ There is no Dock icon and no main window. MacEQ is a menu-bar-only app.
 | **+** (graphic mode) | Adds a band at any frequency you type (20 Hz – 20 kHz, up to 16 bands). **Right-click a band to remove it.** |
 | **Reset** (graphic mode) | Sets all bands back to 0 dB. Affects **only the current output device's** profile. |
 | **Band sliders** | Boost/cut that frequency, ±12 dB. Drag snaps to 0.5 dB steps; **double-click a slider to reset it** to 0. |
+| **Frequency labels** (graphic mode) | **Click the number under a slider** to retune that band. Press Return to apply, Escape to cancel. The band keeps its gain and moves into place if it passes a neighbour. |
 | **Preamp** | Overall level before the EQ. Boosting bands adds energy and can clip; the preamp pulls it back. |
 | **Auto** (next to Preamp) | Computes the preamp for you from the current band gains so nothing clips. Leave this on unless you want manual control — it disables the preamp slider while active. |
 | **Status dot + line** | Green = engine running. Shows the output device, sample rate, round-trip latency, and CPU use. |

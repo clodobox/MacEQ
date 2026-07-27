@@ -38,6 +38,22 @@ public func peakingCoefficients(sampleRate: Double, frequency: Double, q: Double
     return BiquadCoefficients(b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0)
 }
 
+/// Whether a section passes its input through untouched, i.e. H(z) = 1.
+///
+/// A peaking or shelving filter at 0 dB gain normalizes to b == a exactly (not
+/// approximately), so such sections can be dropped from a cascade without
+/// changing a single output sample. Worth doing: a flat graphic EQ would
+/// otherwise run a biquad per band, per channel, on every callback forever —
+/// which is pure waste, and disproportionately expensive on Intel.
+public func isIdentitySection(_ section: BiquadCoefficients) -> Bool {
+    // Tolerance rather than == : coefficients arrive via transcendental math,
+    // and a section this close to identity is inaudible either way.
+    let epsilon = 1e-12
+    return abs(section.b0 - 1.0) < epsilon
+        && abs(section.b1 - section.a1) < epsilon
+        && abs(section.b2 - section.a2) < epsilon
+}
+
 /// Magnitude response in dB of a cascade of biquads at one frequency:
 /// |H(e^jω)| evaluated per section and summed in dB.
 public func magnitudeDB(of cascade: [BiquadCoefficients], sampleRate: Double, frequency: Double) -> Double {

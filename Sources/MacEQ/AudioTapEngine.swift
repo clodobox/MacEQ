@@ -3,6 +3,39 @@ import CoreAudio
 import Foundation
 import MacEQCore
 
+// Denormal control lives in fenv.h. Guarded because the module name is an SDK
+// detail: if it ever goes away the app still builds, just without the
+// optimisation below.
+#if canImport(fenv_h)
+import fenv_h
+#endif
+
+/// Puts the calling thread into flush-to-zero / denormals-are-zero mode.
+///
+/// A biquad's state decays exponentially, so once audio stops the filters keep
+/// producing ever smaller outputs — and they get stuck in denormal range rather
+/// than reaching zero (measured: denormals appear 0.6 s into silence and are
+/// still there minutes later). x86 evaluates denormal arithmetic through
+/// microcode assists that are orders of magnitude slower than normal floating
+/// point, so on Intel Macs this reads as steady idle CPU; Apple silicon handles
+/// denormals in hardware and shows nothing.
+///
+/// Deliberately scoped to the audio thread. Apple's fenv.h warns that the math
+/// and system libraries may return wrong results for edge cases in this mode,
+/// so it must not leak into the rest of the app — and since it is per-thread
+/// state and a dispatch queue does not promise the same thread every time, the
+/// IOProc sets it on each callback. The cost is a control-register write.
+private func disableDenormalsOnCurrentThread() {
+    #if canImport(fenv_h)
+    #if arch(x86_64)
+    var environment = _FE_DFL_DISABLE_SSE_DENORMS_ENV
+    #else
+    var environment = _FE_DFL_DISABLE_DENORMS_ENV
+    #endif
+    _ = withUnsafePointer(to: &environment) { fesetenv($0) }
+    #endif
+}
+
 /// Hands the current EQ kernel to the audio thread. The IOProc does a single
 /// reference load per callback; `nil` means bypass (pure passthrough). The owner
 /// must keep recently replaced kernels alive briefly (retire list) so the audio
@@ -266,6 +299,7 @@ final class AudioTapEngine {
             try checkOSStatus(
                 AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, ioQueue) {
                     _, inInputData, _, outOutputData, _ in
+                    disableDenormalsOnCurrentThread()
                     passthrough(input: inInputData, output: outOutputData, stats: stats)
                     if compensationGain != 1 {
                         applyOutputGain(compensationGain, output: outOutputData)

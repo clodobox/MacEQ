@@ -49,6 +49,12 @@ struct EQPopoverView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var showAddBand = false
     @State private var addBandText = ""
+    /// Which band's frequency label is currently being retuned, and its draft
+    /// text. Only one at a time: a permanent text field per column would be
+    /// unreadably narrow once there are more than a handful of bands.
+    @State private var editingBandIndex: Int?
+    @State private var editingBandText = ""
+    @FocusState private var bandFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -203,6 +209,29 @@ struct EQPopoverView: View {
         }
     }
 
+    private func beginBandEdit(at index: Int) {
+        editingBandText = String(format: "%g", controller.bands[index].frequency)
+        editingBandIndex = index
+        bandFieldFocused = true
+    }
+
+    private func cancelBandEdit() {
+        editingBandIndex = nil
+        editingBandText = ""
+    }
+
+    /// Applies the retune. Keeps the field open on a rejected value so the
+    /// number stays visible next to the error rather than silently reverting.
+    private func commitBandFrequency(at index: Int) {
+        guard let frequency = Double(editingBandText) else {
+            cancelBandEdit()
+            return
+        }
+        if controller.setGraphicBandFrequency(at: index, to: frequency) {
+            cancelBandEdit()
+        }
+    }
+
     private func addBand() {
         guard let frequency = Double(addBandText) else { return }
         if controller.addGraphicBand(frequency: frequency) {
@@ -222,9 +251,25 @@ struct EQPopoverView: View {
                         range: EQController.gainRange
                     )
                     .frame(height: 140)
-                    Text(band.label)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    if editingBandIndex == index {
+                        TextField("Hz", text: $editingBandText)
+                            .textFieldStyle(.plain)
+                            .font(.caption2)
+                            .multilineTextAlignment(.center)
+                            .focused($bandFieldFocused)
+                            .onSubmit { commitBandFrequency(at: index) }
+                            .onExitCommand { cancelBandEdit() }
+                    } else {
+                        Text(band.label)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            // Without an explicit shape a Text only accepts taps
+                            // on its glyphs, which makes a 2-3 character label a
+                            // needlessly precise target.
+                            .contentShape(Rectangle())
+                            .onTapGesture { beginBandEdit(at: index) }
+                            .help("Click to change this band's frequency")
+                    }
                     Text(gainLabel(controller.gains[index]))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(.tertiary)

@@ -343,6 +343,27 @@ final class EQController: ObservableObject {
         }
     }
 
+    /// Retunes one band. The list stays sorted, so the band (and its gain) may
+    /// move; returns false and surfaces the reason if the frequency is invalid.
+    @discardableResult
+    func setGraphicBandFrequency(at index: Int, to frequency: Double) -> Bool {
+        do {
+            let result = try updateGraphicBand(
+                at: index, to: frequency, in: bands.map(\.frequency)
+            )
+            let gain = gains[index]
+            bands = result.frequencies.map {
+                EQBand(label: graphicBandLabel(frequency: $0), frequency: $0)
+            }
+            gains.remove(at: index)
+            gains.insert(gain, at: result.index)
+            return true
+        } catch {
+            errorMessage = String(describing: error)
+            return false
+        }
+    }
+
     func removeGraphicBand(at index: Int) {
         do {
             let frequencies = try MacEQCore.removeGraphicBand(at: index, from: bands.map(\.frequency))
@@ -667,18 +688,27 @@ final class EQController: ObservableObject {
     /// The biquad cascade for the current mode. Never empty: an identity peaking
     /// section stands in when the parametric list has no enabled filters.
     func activeCascade(sampleRate: Double) -> [BiquadCoefficients] {
+        let sections: [BiquadCoefficients]
         switch mode {
         case .graphic:
-            return zip(bands, gains).map { band, gain in
+            sections = zip(bands, gains).map { band, gain in
                 peakingCoefficients(sampleRate: sampleRate, frequency: band.frequency, q: Self.bandQ, gainDB: gain)
             }
         case .parametric:
-            let enabled = parametricFilters.filter(\.isEnabled)
-            guard !enabled.isEmpty else {
-                return [peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 1.0, gainDB: 0)]
+            sections = parametricFilters.filter(\.isEnabled).map {
+                coefficients(for: $0, sampleRate: sampleRate)
             }
-            return enabled.map { coefficients(for: $0, sampleRate: sampleRate) }
         }
+        // Sections sitting at 0 dB are exactly H(z) = 1, so running them costs a
+        // biquad per band per channel on every callback and changes nothing.
+        // Dropping them makes a flat EQ nearly free, which matters most on Intel.
+        let active = sections.filter { !isIdentitySection($0) }
+        guard !active.isEmpty else {
+            // The kernel needs a non-empty cascade; one identity section is the
+            // cheapest way to say "pass through".
+            return [peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 1.0, gainDB: 0)]
+        }
+        return active
     }
 
     var currentSampleRate: Double {

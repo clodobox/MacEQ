@@ -89,6 +89,16 @@ public final class EQKernel {
     }
 
     private func applyLimiter(samples: UnsafeMutablePointer<Float>, frameCount: Int, channelCount: Int) {
+        // Fast path: fully released, and no sample can reach the threshold, so
+        // the loop below would multiply everything by exactly 1.0. This is the
+        // common case (audio that never clips), and the loop it skips is scalar
+        // and branchy — the most expensive thing in the chain on Intel.
+        var bufferPeak: Float = 0
+        vDSP_maxmgv(samples, 1, &bufferPeak, vDSP_Length(frameCount * channelCount))
+        if limiterGain >= 1.0 && bufferPeak <= limiterThreshold {
+            return
+        }
+
         var gain = limiterGain
         for frame in 0..<frameCount {
             let base = frame * channelCount
@@ -106,6 +116,9 @@ public final class EQKernel {
                 samples[base + channel] *= gain
             }
         }
-        limiterGain = gain
+        // The release curve approaches 1.0 asymptotically and could otherwise
+        // sit a hair below it forever, which would keep the fast path above
+        // permanently unreachable. Snapping costs at most -0.0001 dB.
+        limiterGain = gain > 0.9999 ? 1.0 : gain
     }
 }

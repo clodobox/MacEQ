@@ -750,6 +750,254 @@ func testGraphicBandRemoval() {
     }
 }
 
+func testGraphicBandFrequencyUpdate() {
+    // Editing in place, no reorder.
+    do {
+        let result = try updateGraphicBand(at: 0, to: 40, in: defaultGraphicBandFrequencies)
+        expect(result.frequencies[0] == 40, "31.5 -> 40 in place")
+        expect(result.index == 0, "no reorder keeps index 0, got \(result.index)")
+        expect(result.frequencies.count == 10, "count unchanged")
+    } catch {
+        expect(false, "in-place edit threw: \(error)")
+    }
+
+    // Editing past neighbours must re-sort and report the new index.
+    do {
+        let result = try updateGraphicBand(at: 4, to: 3000, in: defaultGraphicBandFrequencies)
+        expect(
+            result.frequencies == result.frequencies.sorted(),
+            "list stays sorted after a reordering edit"
+        )
+        expect(result.index == 6, "500 -> 3000 lands between 2k and 4k, got \(result.index)")
+        expect(result.frequencies[result.index] == 3000, "moved band sits at reported index")
+    } catch {
+        expect(false, "reordering edit threw: \(error)")
+    }
+
+    // Setting a band to its own current value is a no-op, not a self-collision.
+    do {
+        let result = try updateGraphicBand(at: 3, to: 250, in: defaultGraphicBandFrequencies)
+        expect(result.frequencies == defaultGraphicBandFrequencies, "same-value edit is a no-op")
+        expect(result.index == 3, "same-value edit keeps index")
+    } catch {
+        expect(false, "same-value edit threw: \(error)")
+    }
+
+    do {
+        _ = try updateGraphicBand(at: 0, to: 25000, in: defaultGraphicBandFrequencies)
+        expect(false, "25 kHz is out of range and should throw")
+    } catch {
+        expect(true, "out-of-range edit throws")
+    }
+
+    do {
+        _ = try updateGraphicBand(at: 0, to: 1020, in: defaultGraphicBandFrequencies)
+        expect(false, "1020 Hz collides with the 1 kHz band and should throw")
+    } catch {
+        expect(true, "colliding edit throws")
+    }
+
+    do {
+        _ = try updateGraphicBand(at: 99, to: 100, in: defaultGraphicBandFrequencies)
+        expect(false, "out-of-bounds index should throw")
+    } catch {
+        expect(true, "out-of-bounds edit throws")
+    }
+}
+
+// MARK: - Identity-section elimination
+
+func testZeroGainPeakingIsExactlyIdentity() {
+    // A 0 dB peaking/shelf section normalizes to b == a, i.e. H(z) = 1 exactly.
+    // This is what makes dropping them from the cascade safe rather than lossy.
+    for frequency in [31.5, 500.0, 1000.0, 16000.0] {
+        let coefficients = peakingCoefficients(
+            sampleRate: 48000, frequency: frequency, q: 2.2, gainDB: 0
+        )
+        expectClose(coefficients.b0, 1.0, tolerance: 1e-12, "b0 == 1 at \(frequency) Hz")
+        expectClose(coefficients.b1, coefficients.a1, tolerance: 1e-12, "b1 == a1 at \(frequency) Hz")
+        expectClose(coefficients.b2, coefficients.a2, tolerance: 1e-12, "b2 == a2 at \(frequency) Hz")
+        expectClose(
+            magnitudeDB(of: [coefficients], sampleRate: 48000, frequency: frequency),
+            0.0, tolerance: 1e-9, "0 dB response at \(frequency) Hz"
+        )
+    }
+
+    for type in [FilterType.lowShelf, .highShelf] {
+        let spec = FilterSpec(type: type, isEnabled: true, frequency: 1000, gainDB: 0, q: 0.7)
+        let coefficients = coefficients(for: spec, sampleRate: 48000)
+        expectClose(coefficients.b0, 1.0, tolerance: 1e-12, "\(type) b0 == 1")
+        expectClose(coefficients.b1, coefficients.a1, tolerance: 1e-12, "\(type) b1 == a1")
+        expectClose(coefficients.b2, coefficients.a2, tolerance: 1e-12, "\(type) b2 == a2")
+    }
+}
+
+func testIdentitySectionDetection() {
+    expect(
+        isIdentitySection(peakingCoefficients(sampleRate: 48000, frequency: 1000, q: 2.2, gainDB: 0)),
+        "0 dB peaking is identity"
+    )
+    expect(
+        !isIdentitySection(peakingCoefficients(sampleRate: 48000, frequency: 1000, q: 2.2, gainDB: 0.5)),
+        "+0.5 dB peaking is not identity"
+    )
+    expect(
+        !isIdentitySection(peakingCoefficients(sampleRate: 48000, frequency: 1000, q: 2.2, gainDB: -3)),
+        "-3 dB peaking is not identity"
+    )
+    // A notch has no gain parameter but is emphatically not identity.
+    expect(
+        !isIdentitySection(
+            coefficients(
+                for: FilterSpec(type: .notch, isEnabled: true, frequency: 1000, gainDB: 0, q: 4),
+                sampleRate: 48000
+            )
+        ),
+        "a notch is not identity"
+    )
+}
+
+func testKernelWithDroppedIdentitySectionsMatchesFullCascade() {
+    // Dropping identity sections must be sample-for-sample equivalent, not merely close.
+    let sampleRate = 48000.0
+    let full = [
+        peakingCoefficients(sampleRate: sampleRate, frequency: 125, q: 2.2, gainDB: 0),
+        peakingCoefficients(sampleRate: sampleRate, frequency: 1000, q: 2.2, gainDB: 6),
+        peakingCoefficients(sampleRate: sampleRate, frequency: 8000, q: 2.2, gainDB: 0),
+    ]
+    let pruned = full.filter { !isIdentitySection($0) }
+    expect(pruned.count == 1, "two identity sections dropped, got \(pruned.count)")
+
+    guard let fullKernel = EQKernel(
+            cascade: full, preampDB: 0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: false
+        ),
+        let prunedKernel = EQKernel(
+            cascade: pruned, preampDB: 0, sampleRate: sampleRate, maxChannels: 2, limiterEnabled: false
+        )
+    else {
+        expect(false, "kernel construction failed")
+        return
+    }
+
+    var a = pseudoRandomSignal(count: 2048, seed: 99)
+    var b = a
+    a.withUnsafeMutableBufferPointer { buffer in
+        fullKernel.process(interleaved: buffer.baseAddress!, frameCount: 1024, channelCount: 2)
+    }
+    b.withUnsafeMutableBufferPointer { buffer in
+        prunedKernel.process(interleaved: buffer.baseAddress!, frameCount: 1024, channelCount: 2)
+    }
+    var maxDifference: Float = 0
+    for index in a.indices {
+        maxDifference = max(maxDifference, abs(a[index] - b[index]))
+    }
+    // Not bit-identical, and that is expected: the sections are exact identity
+    // in real arithmetic (see testZeroGainPeakingIsExactlyIdentity), but vDSP
+    // runs Float32, so each redundant section contributes rounding. The gap is
+    // ~-83 dBFS on a full-scale signal — far below audibility.
+    expect(
+        maxDifference < 1e-4,
+        "pruned cascade matches full cascade within Float32 rounding, max diff \(maxDifference)"
+    )
+
+    // And the pruning is not merely tolerable but strictly better: fewer
+    // sections means less accumulated error, so the pruned output is closer to
+    // a double-precision reference than the full cascade is.
+    let reference = doublePrecisionBiquad(
+        input: pseudoRandomSignal(count: 2048, seed: 99),
+        section: full[1],
+        channelCount: 2
+    )
+    var fullError = 0.0
+    var prunedError = 0.0
+    for index in reference.indices {
+        fullError = max(fullError, abs(Double(a[index]) - reference[index]))
+        prunedError = max(prunedError, abs(Double(b[index]) - reference[index]))
+    }
+    expect(
+        prunedError <= fullError,
+        "pruned cascade is at least as accurate: pruned \(prunedError) vs full \(fullError)"
+    )
+}
+
+/// Direct Form I reference in Double, per channel — the ground truth the Float32
+/// kernels are compared against.
+func doublePrecisionBiquad(
+    input: [Float], section: BiquadCoefficients, channelCount: Int
+) -> [Double] {
+    var output = [Double](repeating: 0, count: input.count)
+    for channel in 0..<channelCount {
+        var x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0
+        var index = channel
+        while index < input.count {
+            let x = Double(input[index])
+            let y = section.b0 * x + section.b1 * x1 + section.b2 * x2
+                - section.a1 * y1 - section.a2 * y2
+            output[index] = y
+            x2 = x1; x1 = x
+            y2 = y1; y1 = y
+            index += channelCount
+        }
+    }
+    return output
+}
+
+// MARK: - Denormal behaviour during silence
+
+/// The mechanism behind steady idle CPU on Intel: a biquad's state decays
+/// exponentially, so after audio stops the filter keeps producing ever-smaller
+/// outputs that spend a long stretch in denormal range before reaching zero.
+/// x86 handles denormal arithmetic with microcode assists that are orders of
+/// magnitude slower than normal floating point; Apple silicon does not stall.
+///
+/// This test asserts the precondition (denormals really do occur), which holds
+/// on every architecture, rather than the timing penalty, which does not.
+func testBiquadStateReachesDenormalsDuringSilence() {
+    let sampleRate = 48000.0
+    let cascade = [peakingCoefficients(sampleRate: sampleRate, frequency: 125, q: 2.2, gainDB: 6)]
+    guard let kernel = EQKernel(
+        cascade: cascade, preampDB: 0, sampleRate: sampleRate,
+        maxChannels: 2, limiterEnabled: false
+    ) else {
+        expect(false, "kernel construction failed")
+        return
+    }
+
+    let frameCount = 512
+    let channelCount = 2
+
+    // Excite the filter, then feed pure silence and watch the tail decay.
+    var burst = pseudoRandomSignal(count: frameCount * channelCount, seed: 7)
+    burst.withUnsafeMutableBufferPointer { buffer in
+        kernel.process(
+            interleaved: buffer.baseAddress!, frameCount: frameCount, channelCount: channelCount
+        )
+    }
+
+    var sawDenormal = false
+    var silentBuffersUntilFullyZero = 0
+    for buffer in 0..<4000 {
+        var silence = [Float](repeating: 0, count: frameCount * channelCount)
+        silence.withUnsafeMutableBufferPointer { pointer in
+            kernel.process(
+                interleaved: pointer.baseAddress!, frameCount: frameCount, channelCount: channelCount
+            )
+        }
+        if silence.contains(where: { $0.isSubnormal }) {
+            sawDenormal = true
+        }
+        if silence.contains(where: { $0 != 0 }) {
+            silentBuffersUntilFullyZero = buffer + 1
+        }
+    }
+
+    expect(sawDenormal, "the decaying tail passes through denormal values during silence")
+    expect(
+        silentBuffersUntilFullyZero > 0,
+        "the tail takes \(silentBuffersUntilFullyZero) silent buffers to reach exact zero"
+    )
+}
+
 testLimiterCatchesOvers()
 testLimiterTransparentBelowThreshold()
 testSpectrumAnalyzerFindsSine()
@@ -762,6 +1010,11 @@ testGraphicBandDefaults()
 testGraphicBandLabels()
 testGraphicBandInsertion()
 testGraphicBandRemoval()
+testGraphicBandFrequencyUpdate()
+testZeroGainPeakingIsExactlyIdentity()
+testIdentitySectionDetection()
+testKernelWithDroppedIdentitySectionsMatchesFullCascade()
+testBiquadStateReachesDenormalsDuringSilence()
 
 if failureCount > 0 {
     print("\(failureCount) of \(expectationCount) expectations FAILED")

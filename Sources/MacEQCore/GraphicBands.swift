@@ -79,6 +79,35 @@ public func insertGraphicBand(
     return (result, index)
 }
 
+/// Changes one band's frequency, re-sorting if it moved past a neighbour.
+/// Returns the new list and the edited band's new index, so callers can move
+/// its gain with it. Setting a band to the value it already has is a no-op
+/// (it must not collide with itself).
+public func updateGraphicBand(
+    at index: Int, to frequency: Double, in frequencies: [Double]
+) throws -> (frequencies: [Double], index: Int) {
+    guard frequencies.indices.contains(index) else {
+        throw GraphicBandError.indexOutOfBounds(index: index, count: frequencies.count)
+    }
+    guard graphicBandFrequencyRange.contains(frequency) else {
+        throw GraphicBandError.frequencyOutOfRange(frequency)
+    }
+    if frequencies[index] == frequency {
+        return (frequencies, index)
+    }
+    for (other, existing) in frequencies.enumerated() where other != index {
+        let ratio = max(frequency, existing) / min(frequency, existing)
+        if ratio < minimumBandSpacingRatio {
+            throw GraphicBandError.tooCloseToExistingBand(new: frequency, existing: existing)
+        }
+    }
+    var result = frequencies
+    result.remove(at: index)
+    let newIndex = result.firstIndex { $0 > frequency } ?? result.count
+    result.insert(frequency, at: newIndex)
+    return (result, newIndex)
+}
+
 /// Removes the band at `index`, refusing to empty the list.
 public func removeGraphicBand(at index: Int, from frequencies: [Double]) throws -> [Double] {
     guard frequencies.indices.contains(index) else {
