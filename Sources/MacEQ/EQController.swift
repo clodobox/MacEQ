@@ -896,6 +896,7 @@ final class EQController: ObservableObject {
         updateCPUUsage()
         let stats = engine.stats
         let peakDB: Double = stats.lastPeak > 0 ? Double(20 * log10(stats.lastPeak)) : -120
+        let outputPeakDB: Double = stats.lastOutputPeak > 0 ? Double(20 * log10(stats.lastOutputPeak)) : -120
         statusModel.summary = String(
             format: "%@ · %.0f kHz · %.1f ms · CPU %.1f%%",
             status.outputDeviceName,
@@ -906,7 +907,8 @@ final class EQController: ObservableObject {
         var lines = [
             "Tap format: \(status.tapFormatDescription)",
             String(format: "IO buffer: %u frames (~%.1f ms)", status.bufferFrameSize, Double(status.bufferFrameSize) / status.sampleRate * 1000),
-            String(format: "Peak: %.1f dBFS", peakDB),
+            String(format: "Tap peak: %.1f dBFS", peakDB),
+            String(format: "Output peak: %.1f dBFS", outputPeakDB),
             "Callbacks: \(stats.callbackCount), silent streak: \(stats.consecutiveZeroBuffers)",
             "Watchdog restarts: \(watchdogRestartCount)",
         ]
