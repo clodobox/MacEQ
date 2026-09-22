@@ -112,9 +112,19 @@ final class IOStats {
     var lastPeakBits: UInt32 = 0
     var lastRMSBits: UInt32 = 0
     var consecutiveZeroBuffers: UInt64 = 0
+    /// Peak of the buffer actually handed to the output device, measured after
+    /// gain/convolver/kernel — separate from `lastPeak` (the tap's own level) so a
+    /// live tap that never reaches the hardware is distinguishable from a dead tap.
+    var lastOutputPeakBits: UInt32 = 0
+    /// Shape of the real output AudioBufferList, for diagnosing devices whose
+    /// aggregate output side doesn't look like a plain single interleaved buffer.
+    var lastOutputBufferCount: UInt32 = 0
+    var lastOutputChannelCount: UInt32 = 0
+    var lastOutputFrameCount: UInt32 = 0
 
     var lastPeak: Float { Float(bitPattern: lastPeakBits) }
     var lastRMS: Float { Float(bitPattern: lastRMSBits) }
+    var lastOutputPeak: Float { Float(bitPattern: lastOutputPeakBits) }
 }
 
 /// Snapshot of the running audio path, for display and per-device profiles.
@@ -312,6 +322,7 @@ final class AudioTapEngine {
                     if let kernel = kernelHolder.kernel {
                         applyKernel(kernel, output: outOutputData)
                     }
+                    measureOutputPeak(outOutputData, into: stats)
                     if captureRing.captureEnabled {
                         captureOutput(outOutputData, into: captureRing)
                     }
@@ -449,6 +460,34 @@ final class AudioTapEngine {
             )
         }
         stop()
+    }
+}
+
+/// Peak across every output buffer, after all processing — what's actually
+/// handed to the device, as opposed to `IOStats.lastPeak` (the tap's own level).
+/// Real-time safe.
+private func measureOutputPeak(_ output: UnsafeMutablePointer<AudioBufferList>, into stats: IOStats) {
+    let outputBuffers = UnsafeMutableAudioBufferListPointer(output)
+    var peak: Float = 0
+    for buffer in outputBuffers {
+        guard let data = buffer.mData else { continue }
+        let sampleCount = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+        guard sampleCount > 0 else { continue }
+        let samples = data.assumingMemoryBound(to: Float.self)
+        var bufferPeak: Float = 0
+        vDSP_maxmgv(samples, 1, &bufferPeak, vDSP_Length(sampleCount))
+        if bufferPeak > peak { peak = bufferPeak }
+    }
+    stats.lastOutputPeakBits = peak.bitPattern
+
+    stats.lastOutputBufferCount = UInt32(outputBuffers.count)
+    if let first = outputBuffers.first {
+        let channels = max(first.mNumberChannels, 1)
+        stats.lastOutputChannelCount = channels
+        stats.lastOutputFrameCount = first.mDataByteSize / UInt32(MemoryLayout<Float>.size) / channels
+    } else {
+        stats.lastOutputChannelCount = 0
+        stats.lastOutputFrameCount = 0
     }
 }
 
