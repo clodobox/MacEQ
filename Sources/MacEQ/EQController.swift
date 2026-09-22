@@ -909,6 +909,7 @@ final class EQController: ObservableObject {
             String(format: "IO buffer: %u frames (~%.1f ms)", status.bufferFrameSize, Double(status.bufferFrameSize) / status.sampleRate * 1000),
             String(format: "Tap peak: %.1f dBFS", peakDB),
             String(format: "Output peak: %.1f dBFS", outputPeakDB),
+            "Output buffers: \(stats.lastOutputBufferCount), channels: \(stats.lastOutputChannelCount), frames: \(stats.lastOutputFrameCount)",
             "Callbacks: \(stats.callbackCount), silent streak: \(stats.consecutiveZeroBuffers)",
             "Watchdog restarts: \(watchdogRestartCount)",
         ]

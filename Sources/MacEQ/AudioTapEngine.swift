@@ -116,6 +116,11 @@ final class IOStats {
     /// gain/convolver/kernel — separate from `lastPeak` (the tap's own level) so a
     /// live tap that never reaches the hardware is distinguishable from a dead tap.
     var lastOutputPeakBits: UInt32 = 0
+    /// Shape of the real output AudioBufferList, for diagnosing devices whose
+    /// aggregate output side doesn't look like a plain single interleaved buffer.
+    var lastOutputBufferCount: UInt32 = 0
+    var lastOutputChannelCount: UInt32 = 0
+    var lastOutputFrameCount: UInt32 = 0
 
     var lastPeak: Float { Float(bitPattern: lastPeakBits) }
     var lastRMS: Float { Float(bitPattern: lastRMSBits) }
@@ -250,13 +255,15 @@ final class AudioTapEngine {
             // 2. Private aggregate: the real output device anchors the clock and
             //    receives our output; the tap feeds the input side. TapAutoStart is
             //    required or the tap delivers zero samples.
-            //    The tap is always a fixed 2-channel stream, so pin the main
-            //    sub-device's output side to 2 channels as well — on an interface
-            //    that exposes more (e.g. a 4-out audio interface), leaving this
-            //    unset lets the aggregate's format negotiation follow the device's
-            //    full channel count instead, which has been observed to leave the
-            //    tap delivering nothing but zero buffers rather than just mis-sized
-            //    ones.
+            //    Do not pin kAudioSubDeviceOutputChannelsKey to the tap's 2 channels:
+            //    on hardware whose channel count is fixed (e.g. a 4-out interface
+            //    that has no lower-channel format at all), asking the aggregate for
+            //    fewer channels than the device can ever present has been observed
+            //    to leave the aggregate's output side with nothing to write to
+            //    (output peak stuck at -120 dBFS) rather than gracefully narrowing
+            //    it. Let the main sub-device keep its native channel count instead;
+            //    `passthrough` below maps the tap's stereo onto however many
+            //    channels the device actually reports.
             let aggregateUID = UUID().uuidString
             let description: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "MacEQ Aggregate",
@@ -266,10 +273,7 @@ final class AudioTapEngine {
                 kAudioAggregateDeviceIsStackedKey: false,
                 kAudioAggregateDeviceTapAutoStartKey: true,
                 kAudioAggregateDeviceSubDeviceListKey: [
-                    [
-                        kAudioSubDeviceUIDKey: outputUID,
-                        kAudioSubDeviceOutputChannelsKey: 2,
-                    ]
+                    [kAudioSubDeviceUIDKey: outputUID]
                 ],
                 kAudioAggregateDeviceTapListKey: [
                     [
@@ -484,6 +488,16 @@ private func measureOutputPeak(_ output: UnsafeMutablePointer<AudioBufferList>, 
         if bufferPeak > peak { peak = bufferPeak }
     }
     stats.lastOutputPeakBits = peak.bitPattern
+
+    stats.lastOutputBufferCount = UInt32(outputBuffers.count)
+    if let first = outputBuffers.first {
+        let channels = max(first.mNumberChannels, 1)
+        stats.lastOutputChannelCount = channels
+        stats.lastOutputFrameCount = first.mDataByteSize / UInt32(MemoryLayout<Float>.size) / channels
+    } else {
+        stats.lastOutputChannelCount = 0
+        stats.lastOutputFrameCount = 0
+    }
 }
 
 /// Feeds the first output buffer (as heard, post-EQ) into the spectrum ring.
