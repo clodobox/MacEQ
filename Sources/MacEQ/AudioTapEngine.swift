@@ -495,8 +495,19 @@ private func applyKernel(_ kernel: EQKernel, output: UnsafeMutablePointer<AudioB
     }
 }
 
-/// Copies tapped input buffers verbatim to the output buffers and updates stats.
-/// Runs on the real-time audio thread — free function, no captures beyond `stats`.
+/// Maps the tap's stereo audio onto the output device's channel layout and
+/// updates stats. Runs on the real-time audio thread — free function, no
+/// captures beyond `stats`.
+///
+/// The tap is always a fixed 2-channel interleaved stream (CATapDescription's
+/// stereo-global-tap initializer guarantees this), but the real output device
+/// can expose any channel count and split it across any number of buffers —
+/// an interleaved 4-channel buffer on a multi-output audio interface, for
+/// instance. A byte-for-byte memcpy assumes the tap's layout already matches
+/// the device's, which only holds for plain stereo outputs; on anything else
+/// it silently scrambles channels or leaves the back half of every buffer
+/// untouched. Instead, walk the device's channels in order, write tap L/R
+/// onto the first two, and silence the rest.
 private func passthrough(
     input: UnsafePointer<AudioBufferList>,
     output: UnsafeMutablePointer<AudioBufferList>,
@@ -510,16 +521,11 @@ private func passthrough(
     var sampleCount = 0
     var framesThisCallback: UInt64 = 0
 
-    for bufferIndex in 0..<min(inputBuffers.count, outputBuffers.count) {
-        let inBuffer = inputBuffers[bufferIndex]
-        let outBuffer = outputBuffers[bufferIndex]
-        guard let inData = inBuffer.mData, let outData = outBuffer.mData else { continue }
-
-        let byteCount = Int(min(inBuffer.mDataByteSize, outBuffer.mDataByteSize))
-        memcpy(outData, inData, byteCount)
-
+    for inBuffer in inputBuffers {
+        guard let inData = inBuffer.mData else { continue }
         let samples = inData.assumingMemoryBound(to: Float.self)
-        let count = byteCount / MemoryLayout<Float>.size
+        let count = Int(inBuffer.mDataByteSize) / MemoryLayout<Float>.size
+        guard count > 0 else { continue }
         var bufferPeak: Float = 0
         vDSP_maxmgv(samples, 1, &bufferPeak, vDSP_Length(count))
         if bufferPeak > peak { peak = bufferPeak }
@@ -529,6 +535,38 @@ private func passthrough(
         sampleCount += count
         let channels = max(inBuffer.mNumberChannels, 1)
         framesThisCallback += UInt64(count) / UInt64(channels)
+    }
+
+    if let firstInput = inputBuffers.first, let inData = firstInput.mData {
+        let inChannels = Int(max(firstInput.mNumberChannels, 1))
+        let inFrameCount = Int(firstInput.mDataByteSize) / MemoryLayout<Float>.size / inChannels
+        let inSamples = inData.assumingMemoryBound(to: Float.self)
+
+        var outputChannelOffset = 0
+        for outBuffer in outputBuffers {
+            guard let outData = outBuffer.mData else { continue }
+            let outChannels = Int(max(outBuffer.mNumberChannels, 1))
+            let outFrameCount = Int(outBuffer.mDataByteSize) / MemoryLayout<Float>.size / outChannels
+            let outSamples = outData.assumingMemoryBound(to: Float.self)
+            let frames = min(inFrameCount, outFrameCount)
+
+            for frame in 0..<frames {
+                for channel in 0..<outChannels {
+                    let globalChannel = outputChannelOffset + channel
+                    outSamples[frame * outChannels + channel] = globalChannel < inChannels
+                        ? inSamples[frame * inChannels + globalChannel]
+                        : 0
+                }
+            }
+            if frames < outFrameCount {
+                for frame in frames..<outFrameCount {
+                    for channel in 0..<outChannels {
+                        outSamples[frame * outChannels + channel] = 0
+                    }
+                }
+            }
+            outputChannelOffset += outChannels
+        }
     }
 
     stats.callbackCount &+= 1
