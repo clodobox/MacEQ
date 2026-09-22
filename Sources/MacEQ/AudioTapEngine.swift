@@ -255,6 +255,12 @@ final class AudioTapEngine {
             // 2. Private aggregate: the real output device anchors the clock and
             //    receives our output; the tap feeds the input side. TapAutoStart is
             //    required or the tap delivers zero samples.
+            //
+            //    The main sub-device keeps its native channel count (no format
+            //    pinning): `passthrough` below maps the tap's fixed stereo onto
+            //    however many output channels the device actually reports, and
+            //    onto whichever of its input buffers is the tap (see that
+            //    function's doc comment for why device order matters there too).
             let aggregateUID = UUID().uuidString
             let description: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "MacEQ Aggregate",
@@ -534,8 +540,33 @@ private func applyKernel(_ kernel: EQKernel, output: UnsafeMutablePointer<AudioB
     }
 }
 
-/// Copies tapped input buffers verbatim to the output buffers and updates stats.
-/// Runs on the real-time audio thread — free function, no captures beyond `stats`.
+/// Maps the tap's stereo audio onto the output device's channel layout and
+/// updates stats. Runs on the real-time audio thread — free function, no
+/// captures beyond `stats`.
+///
+/// The tap is always a fixed 2-channel interleaved stream (CATapDescription's
+/// stereo-global-tap initializer guarantees this), but the real output device
+/// can expose any channel count and split it across any number of buffers —
+/// an interleaved 4-channel buffer on a multi-output audio interface, for
+/// instance. A byte-for-byte memcpy assumes the tap's layout already matches
+/// the device's, which only holds for plain stereo outputs; on anything else
+/// it silently scrambles channels or leaves the back half of every buffer
+/// untouched. Instead, walk the device's channels in order, write tap L/R
+/// onto the first two, and silence the rest.
+///
+/// The *input* side has its own trap: on an interface that also has physical
+/// input channels (e.g. a USB audio interface's line/mic in), Core Audio hands
+/// the IOProc TWO input buffers, not one — the main sub-device's own hardware
+/// input, followed by the tap's loopback, matching the order they're declared
+/// in the aggregate (sub-device list, then tap list). Reading `inputBuffers.first`
+/// grabs the hardware input instead of the tap: on hardware with no signal on
+/// its physical input, that measured as a near-silent output while the tap
+/// itself (scanned separately for `Tap peak`, across every input buffer) showed
+/// a live signal — the output device was faithfully playing back its own quiet
+/// input noise floor, not the system audio. The tap is always the buffer added
+/// last, so `.last` is correct both here (two buffers) and on plain
+/// output-only devices, which contribute no hardware-input buffer and so only
+/// ever have the one (where `.last` and `.first` are the same buffer).
 private func passthrough(
     input: UnsafePointer<AudioBufferList>,
     output: UnsafeMutablePointer<AudioBufferList>,
@@ -549,25 +580,48 @@ private func passthrough(
     var sampleCount = 0
     var framesThisCallback: UInt64 = 0
 
-    for bufferIndex in 0..<min(inputBuffers.count, outputBuffers.count) {
-        let inBuffer = inputBuffers[bufferIndex]
-        let outBuffer = outputBuffers[bufferIndex]
-        guard let inData = inBuffer.mData, let outData = outBuffer.mData else { continue }
-
-        let byteCount = Int(min(inBuffer.mDataByteSize, outBuffer.mDataByteSize))
-        memcpy(outData, inData, byteCount)
-
+    if let tapBuffer = inputBuffers.last, let inData = tapBuffer.mData {
         let samples = inData.assumingMemoryBound(to: Float.self)
-        let count = byteCount / MemoryLayout<Float>.size
-        var bufferPeak: Float = 0
-        vDSP_maxmgv(samples, 1, &bufferPeak, vDSP_Length(count))
-        if bufferPeak > peak { peak = bufferPeak }
-        var bufferSumOfSquares: Float = 0
-        vDSP_svesq(samples, 1, &bufferSumOfSquares, vDSP_Length(count))
-        sumOfSquares += bufferSumOfSquares
-        sampleCount += count
-        let channels = max(inBuffer.mNumberChannels, 1)
-        framesThisCallback += UInt64(count) / UInt64(channels)
+        let count = Int(tapBuffer.mDataByteSize) / MemoryLayout<Float>.size
+        if count > 0 {
+            vDSP_maxmgv(samples, 1, &peak, vDSP_Length(count))
+            vDSP_svesq(samples, 1, &sumOfSquares, vDSP_Length(count))
+            sampleCount = count
+            let channels = max(tapBuffer.mNumberChannels, 1)
+            framesThisCallback = UInt64(count) / UInt64(channels)
+        }
+    }
+
+    if let tapBuffer = inputBuffers.last, let inData = tapBuffer.mData {
+        let inChannels = Int(max(tapBuffer.mNumberChannels, 1))
+        let inFrameCount = Int(tapBuffer.mDataByteSize) / MemoryLayout<Float>.size / inChannels
+        let inSamples = inData.assumingMemoryBound(to: Float.self)
+
+        var outputChannelOffset = 0
+        for outBuffer in outputBuffers {
+            guard let outData = outBuffer.mData else { continue }
+            let outChannels = Int(max(outBuffer.mNumberChannels, 1))
+            let outFrameCount = Int(outBuffer.mDataByteSize) / MemoryLayout<Float>.size / outChannels
+            let outSamples = outData.assumingMemoryBound(to: Float.self)
+            let frames = min(inFrameCount, outFrameCount)
+
+            for frame in 0..<frames {
+                for channel in 0..<outChannels {
+                    let globalChannel = outputChannelOffset + channel
+                    outSamples[frame * outChannels + channel] = globalChannel < inChannels
+                        ? inSamples[frame * inChannels + globalChannel]
+                        : 0
+                }
+            }
+            if frames < outFrameCount {
+                for frame in frames..<outFrameCount {
+                    for channel in 0..<outChannels {
+                        outSamples[frame * outChannels + channel] = 0
+                    }
+                }
+            }
+            outputChannelOffset += outChannels
+        }
     }
 
     stats.callbackCount &+= 1
