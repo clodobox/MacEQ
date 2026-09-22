@@ -245,6 +245,13 @@ final class AudioTapEngine {
             // 2. Private aggregate: the real output device anchors the clock and
             //    receives our output; the tap feeds the input side. TapAutoStart is
             //    required or the tap delivers zero samples.
+            //    The tap is always a fixed 2-channel stream, so pin the main
+            //    sub-device's output side to 2 channels as well — on an interface
+            //    that exposes more (e.g. a 4-out audio interface), leaving this
+            //    unset lets the aggregate's format negotiation follow the device's
+            //    full channel count instead, which has been observed to leave the
+            //    tap delivering nothing but zero buffers rather than just mis-sized
+            //    ones.
             let aggregateUID = UUID().uuidString
             let description: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "MacEQ Aggregate",
@@ -254,7 +261,10 @@ final class AudioTapEngine {
                 kAudioAggregateDeviceIsStackedKey: false,
                 kAudioAggregateDeviceTapAutoStartKey: true,
                 kAudioAggregateDeviceSubDeviceListKey: [
-                    [kAudioSubDeviceUIDKey: outputUID]
+                    [
+                        kAudioSubDeviceUIDKey: outputUID,
+                        kAudioSubDeviceOutputChannelsKey: 2,
+                    ]
                 ],
                 kAudioAggregateDeviceTapListKey: [
                     [
