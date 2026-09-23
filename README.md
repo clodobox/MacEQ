@@ -1,3 +1,11 @@
+## Note for this fork
+
+This fix is **AI Slop** !
+
+This is a fix I came up with using Claude Code. My Presonus 26 audio interface (4 out / 2 in) wasn't working at all with MacEQ, unlike more standard interfaces like my MacBook's headphones and speakers.
+
+It works, but the fix is completely vibecoded and hasn’t been reviewed by someone with expertise. Use with caution!
+
 # MacEQ
 
 A free, open-source, system-wide equalizer for macOS. It lives in your menu bar
