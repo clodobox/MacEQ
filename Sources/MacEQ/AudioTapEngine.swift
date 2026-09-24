@@ -264,6 +264,16 @@ final class AudioTapEngine {
             //    it. Let the main sub-device keep its native channel count instead;
             //    `passthrough` below maps the tap's stereo onto however many
             //    channels the device actually reports.
+            //    DO pin kAudioSubDeviceInputChannelsKey to 0. On an input-capable
+            //    interface (e.g. one with its own line/mic inputs), leaving this
+            //    unset lets the sub-device's own physical inputs join the
+            //    aggregate's input side alongside the tap. `passthrough` only reads
+            //    `inputBuffers.first` as the tap; if the aggregate orders the
+            //    sub-device's (silent) native input ahead of the tap, that first
+            //    buffer is the wrong one and every sample written to the output is
+            //    near-silence, even though the tap itself is capturing real audio.
+            //    Output-only devices (speakers, headphones) have no input side to
+            //    race against, which is why this only bites input+output interfaces.
             let aggregateUID = UUID().uuidString
             let description: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "MacEQ Aggregate",
@@ -273,7 +283,10 @@ final class AudioTapEngine {
                 kAudioAggregateDeviceIsStackedKey: false,
                 kAudioAggregateDeviceTapAutoStartKey: true,
                 kAudioAggregateDeviceSubDeviceListKey: [
-                    [kAudioSubDeviceUIDKey: outputUID]
+                    [
+                        kAudioSubDeviceUIDKey: outputUID,
+                        kAudioSubDeviceInputChannelsKey: 0,
+                    ]
                 ],
                 kAudioAggregateDeviceTapListKey: [
                     [
